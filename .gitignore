@@ -1,0 +1,4 @@
+.DS_Store
+/satellite_imagery/key.py
+__pycache__/
+*.pyc
