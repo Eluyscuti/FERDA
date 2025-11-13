@@ -8,11 +8,15 @@ You get 5000 credits per 10 minutes, which is more than enough.
 '''
 import key # holds the FIRMS API key
 import pandas as pd
+import geopandas as gpd
 import plotnine
 import requests
 
 debug = False
 show_credits_used = True
+
+# keep states_df as a global so we don't have to reread it a lot
+states_df = None
 
 # check how many transactions left in our key
 def check_key_transactions():
@@ -99,8 +103,8 @@ def display_fire_data(df):
     plot.show()
 
     # TODO: 
-    # adjust df to have only california or united states.
     # overlay US map onto it.
+    # adjust df to have only california or united states.
 
 
 if __name__ == '__main__':
