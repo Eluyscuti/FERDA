@@ -1,4 +1,5 @@
 .DS_Store
 /satellite_imagery/key.py
+/satellite_imagery/*.geojson
 __pycache__/
 *.pyc

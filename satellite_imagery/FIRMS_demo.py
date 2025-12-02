@@ -9,14 +9,12 @@ You get 5000 credits per 10 minutes, which is more than enough.
 import key # holds the FIRMS API key
 import pandas as pd
 import geopandas as gpd
-import plotnine
+from plotnine import *
 import requests
 
 debug = False
 show_credits_used = True
 
-# keep states_df as a global so we don't have to reread it a lot
-states_df = None
 
 # check how many transactions left in our key
 def check_key_transactions():
@@ -86,44 +84,125 @@ def query_fire_detection(source, area_coordinates='world', date=1):
     except:
         pass
 
+def format_boundaries(filename):
+    df = gpd.read_file(filename)
+    #print(df.columns)
+
+    # Make sure projection is lat/lon
+    df = df.to_crs(epsg=4326)
+
+    # simplify bc it's taking forever
+    df["geometry"] = df["geometry"].simplify(0.05)
+
+
+    # Break multipolygons into polygons
+    df = df.explode(index_parts=True).reset_index(drop=True)
+
+    rows = []
+
+    for idx, row in df.iterrows():
+        geom = row.geometry
+
+        # Only handle polygons
+        if geom.geom_type == "Polygon":
+            x, y = geom.exterior.coords.xy
+            for lon, lat in zip(x, y):
+                rows.append({
+                    "country": row["NAM_0"],
+                    "poly_id": f"{row['ISO_A3']}_{idx}",   # ✅ unique polygon group
+
+                    "lon": lon,
+                    "lat": lat
+                })
+
+    df = pd.DataFrame(rows)
+    return df
+
 def display_fire_data(df):
 
-    # Map abbreviations to full words
+    #states_df = format_boundaries('us-state-boundaries.geojson')
+    boundaries = format_boundaries('World Bank Official Boundaries.geojson')
+
     conf_map = {'l': 'low', 'n': 'nominal', 'h': 'high'}
     df = df.copy()
     df['confidence'] = df['confidence'].map(conf_map)
 
     plot = (
-        plotnine.ggplot(df)
-        + plotnine.geom_point(plotnine.aes(x='longitude', y='latitude', color='confidence'))
-        + plotnine.labs(title=f"Fire Data from {df['instrument'].iloc[0]}", color='Confidence Level')
-        + plotnine.theme(figure_size=(14, 6))
+        ggplot()
+
+        # State outlines
+        + geom_polygon(
+            boundaries,
+            aes(x='lon', y='lat', group='poly_id'),
+            fill=None,
+            color='black',
+            size=0.2
+        )
+
+        # Fire points
+        + geom_point(
+            df,
+            aes(x='longitude', y='latitude', color='confidence'),
+            size=1.5,
+            alpha=0.6
+        )
+
+        + scale_color_manual(
+            values={
+                'low': 'blue',
+                'nominal': 'orange',
+                'high': 'red'
+            }
+        )
+
+        + labs(
+            title=f"Fire Detections from {df['instrument'].iloc[0]}",
+            color='Confidence'
+        )
+
+        + coord_fixed()
+        #+ theme_bw()
     )
 
     plot.show()
-
     # TODO: 
-    # overlay US map onto it.
     # adjust df to have only california or united states.
 
-
-if __name__ == '__main__':
-    start_transactions = check_key_transactions()
-
-    satellite = 'VIIRS_NOAA20_NRT'
-
-    # show date ranges for GOES
-    date_df = check_date_range(satellite)# do date_df = check_date_range('all') to get date ranges for all satellites 
-    print(date_df)
-
-    # try to get one day of fire detection (from VIIRS NRT, of the whole world, past 1 day)
-    area_df = query_fire_detection('VIIRS_NOAA20_NRT', 'world', 1)
-    print(area_df.columns)
-    display_fire_data(area_df)
-
+def show_credit_usage(start_transactions):
     end_transactions = check_key_transactions()
     if show_credits_used:
         if end_transactions >= 0:
             print(f'Used {end_transactions - start_transactions} credits this run. {5000 - end_transactions} credits remain.')
         else:
             print('error in check_key_transactions()')
+
+
+if __name__ == '__main__':
+    #start_transactions = check_key_transactions()
+
+ 
+    '''
+    Satellites:
+        MODIS_NRT           <--
+        MODIS_SP
+        VIIRS_NOAA20_NRT    <-- 
+        VIIRS_NOAA20_SP
+        VIIRS_NOAA21_NRT    <--
+        VIIRS_SNPP_NRT
+        VIIRS_SNPP_SP
+        LANDSAT_NRT
+        GOES_NRT            <-- 
+        BA_VIIRS
+    '''
+
+    satellite = 'MODIS_NRT'
+    #satellite = 'VIIRS_NOAA21_NRT'
+
+    # show date ranges for GOES
+    #date_df = check_date_range(satellite)# do date_df = check_date_range('all') to get date ranges for all satellites #print(date_df)
+
+    # try to get one day of fire detection (from VIIRS NRT, of the whole world, past 1 day)
+    area_df = query_fire_detection('VIIRS_NOAA20_NRT', 'world', 1) #print(area_df.columns)
+    display_fire_data(area_df)
+
+    #show_credit_usage(start_transactions)
