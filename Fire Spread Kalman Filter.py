@@ -58,6 +58,20 @@ NLCD_FUEL_MODELS = {
 }
 DEFAULT_NLCD = 82  # Cultivated Crops — most common in Indiana
 
+# OpenStreetMap landuse/natural tags -> NLCD equivalent codes
+# Used by the Overpass API fallback.
+OSM_TO_NLCD = {
+    "farmland": 82, "farmyard": 82, "orchard": 82, "vineyard": 82,
+    "meadow":   81, "grass": 71, "recreation_ground": 71,
+    "village_green": 71, "cemetery": 71,
+    "forest":   41, "logging": 41,
+    "residential": 22, "commercial": 23, "industrial": 23, "retail": 22,
+    "construction": 31, "brownfield": 31, "quarry": 31, "landfill": 31,
+    "wood":     41, "scrub": 52, "heath": 52, "grassland": 71,
+    "wetland":  90, "marsh": 95, "water": 11,
+    "bare_rock": 31, "sand": 31, "beach": 31,
+}
+
 # -----------------------------------------------------------------------------
 # CDL FUEL MODEL TABLE  (USDA CropScape / Cropland Data Layer codes)
 # CropScape uses different codes from NLCD. Indiana top crops: corn(1),
@@ -189,7 +203,7 @@ class IndianaMapClient:
     Fetches terrain/agriculture data from publicly accessible federal APIs:
 
       1. USDA CropScape (NASS)  — crop/land-cover type at a lat/lon point
-         https://nassgeodata.gmu.edu/axis2/services/CDLService/GetCDLValue
+         https://www.mrlc.gov/geoserver/NLCD_Land_Cover/wms
          CDL codes differ from NLCD; see CDL_FUEL_MODELS below.
 
       2. USDA SSURGO via SDM Tabular Service (NRCS)  — soil drainage class
@@ -206,8 +220,16 @@ class IndianaMapClient:
     maps.indiana.edu has been removed — that server is offline.
     """
 
-    # USDA CropScape REST point-query  (returns CDL crop code at x/y WGS84)
-    CROPSCAPE_URL = "https://nassgeodata.gmu.edu/axis2/services/CDLService/GetCDLValue"
+    # Source A: USGS/MRLC NLCD 2021 WMS GetFeatureInfo
+    # Source: https://www.mrlc.gov/data-services-page
+    MRLC_WMS_URL  = "https://www.mrlc.gov/geoserver/NLCD_Land_Cover/wms"
+    MRLC_LAYER    = "NLCD_2021_Land_Cover_L48"
+
+    # Source B: ESRI Living Atlas NLCD 2021 ImageServer — different CDN/host
+    # Public ArcGIS Image Service, no API key needed.
+    # If MRLC GeoServer is blocked, this hits Esri's CDN instead.
+    ESRI_NLCD_URL = "https://landscape1.arcgis.com/arcgis/rest/services/USA_NLCD_2021/ImageServer/identify"
+    OVERPASS_URL  = "https://overpass-api.de/api/interpreter"
 
     # USDA SSURGO / Soil Data Mart tabular REST  (accepts SQL, returns JSON)
     SDM_URL       = "https://SDMDataAccess.nrcs.usda.gov/tabular/post.rest"
@@ -223,48 +245,143 @@ class IndianaMapClient:
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
         self._cache: dict = {}
-        self._cdl_failed  = False   # set True when CropScape is unreachable
+        self._cdl_failed  = False   # set True when MRLC WMS is unreachable
         self._soil_failed  = False   # set True when SDM is unreachable
 
     def _log(self, msg: str):
         if self.verbose:
             print(f"  |  {msg}")
 
-    # -- 1. Land Cover via USDA CropScape -------------------------------------
+    # -- 1. Land Cover — waterfall across two independent endpoints -----------
     def query_land_cover(self, lat: float, lon: float) -> int:
         """
-        Query USDA CropScape for the Cropland Data Layer (CDL) code at (lat, lon).
-        CDL is updated annually; codes are crop-specific (corn=1, soybeans=5, …).
-        Returns an integer CDL code; see CDL_FUEL_MODELS for the full table.
-        Falls back to DEFAULT_CDL on any error.
-        """
-        key = f"cdl_{lat:.4f}_{lon:.4f}"
-        if key in self._cache:
-            return self._cache[key]
+        Tries two completely independent NLCD sources in sequence:
 
-        self._log("Querying crop type (USDA CropScape / CDL 2023)...")
+          Source A: USGS/MRLC GeoServer WMS GetFeatureInfo
+                    mrlc.gov/geoserver — USGS operated
+          Source B: ESRI Living Atlas NLCD 2021 ImageServer
+                    landscape1.arcgis.com — Esri CDN, different network path
+
+        Both return NLCD 2021 land cover codes. Using two sources means a
+        single network block or outage won't reach the manual picker.
+        """
+        cache_key = f"nlcd_{lat:.4f}_{lon:.4f}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        # ── Source A: MRLC WMS ────────────────────────────────────────────
+        self._log("Querying land cover [1/3] USGS MRLC WMS...")
+        delta = 0.005
+        bbox  = f"{lon-delta},{lat-delta},{lon+delta},{lat+delta}"
         try:
             r = requests.get(
-                self.CROPSCAPE_URL,
-                params={"year": "2023", "x": str(lon), "y": str(lat), "format": "json"},
+                self.MRLC_WMS_URL,
+                params={
+                    "SERVICE":      "WMS",
+                    "VERSION":      "1.1.1",
+                    "REQUEST":      "GetFeatureInfo",
+                    "LAYERS":       self.MRLC_LAYER,
+                    "QUERY_LAYERS": self.MRLC_LAYER,
+                    "STYLES":       "",
+                    "BBOX":         bbox,
+                    "WIDTH":        "11",
+                    "HEIGHT":       "11",
+                    "SRS":          "EPSG:4326",
+                    "X":            "5",
+                    "Y":            "5",
+                    "INFO_FORMAT":  "application/json",
+                    "FEATURE_COUNT":"1",
+                },
                 timeout=self.TIMEOUT,
             )
-            # CropScape returns: {"category":"Soybeans","value":"5"}
-            data = r.json()
-            code = int(data.get("value", DEFAULT_CDL))
-            name = data.get("category", CDL_FUEL_MODELS.get(code, {}).get("name", "Unknown"))
-            if code in CDL_FUEL_MODELS:
-                self._log(f"CDL code {code}: {name}")
-                self._cache[key] = code
-                return code
-            else:
-                self._log(f"CDL code {code} ({name}) not in fuel table — using default")
+            features = r.json().get("features", [])
+            if features:
+                props = features[0].get("properties", {})
+                for k in ("GRAY_INDEX", "value", "pixel"):
+                    if k in props:
+                        code = int(props[k])
+                        if code in NLCD_FUEL_MODELS:
+                            self._log(f"NLCD {code}: {NLCD_FUEL_MODELS[code]['name']} (MRLC)")
+                            self._cache[cache_key] = code
+                            return code
         except Exception as e:
-            self._log(f"CropScape unreachable: {type(e).__name__}")
-            self._cdl_failed = True
+            self._log(f"MRLC WMS failed ({type(e).__name__}) — trying fallback...")
 
-        self._log(f"Defaulting to CDL {DEFAULT_CDL} ({CDL_FUEL_MODELS[DEFAULT_CDL]['name']})")
-        return DEFAULT_CDL
+        # ── Source B: ESRI Living Atlas ImageServer identify ─────────────
+        self._log("Querying land cover [2/3] ESRI Living Atlas NLCD...")
+        try:
+            r = requests.get(
+                self.ESRI_NLCD_URL,
+                params={
+                    "geometry":      f"{lon},{lat}",
+                    "geometryType":  "esriGeometryPoint",
+                    "sr":            "4326",
+                    "returnGeometry":"false",
+                    "f":             "json",
+                },
+                timeout=self.TIMEOUT,
+            )
+            data  = r.json()
+            # ImageServer identify returns {"value": "82", "name": "Cultivated Crops"}
+            value = data.get("value") or data.get("catalogItems", {})
+            if value and str(value).strip() not in ("", "NoData", "Null"):
+                code = int(float(str(value).strip()))
+                if code in NLCD_FUEL_MODELS:
+                    self._log(f"NLCD {code}: {NLCD_FUEL_MODELS[code]['name']} (ESRI Atlas)")
+                    self._cache[cache_key] = code
+                    return code
+        except Exception as e:
+            self._log(f"ESRI Atlas failed ({type(e).__name__})")
+
+        # -- Source C: OpenStreetMap Overpass API --------------------------
+        # Tries two Overpass mirrors in sequence with a User-Agent header.
+        # Overpass silently rate-limits anonymous requests; a descriptive
+        # User-Agent is polite and avoids most blocks.
+        OVERPASS_MIRRORS = [
+            self.OVERPASS_URL,                          # overpass-api.de (main)
+            "https://overpass.kumi.systems/api/interpreter",  # kumi.systems mirror
+        ]
+        HEADERS = {"User-Agent": "FERDA-FireDetection/2.0 (drone fire spread tracker)"}
+        query = (
+            f"[out:json][timeout:8];"
+            f"is_in({lat},{lon})->.a;"
+            f"(area.a[landuse];area.a[natural];);"
+            f"out tags;"
+        )
+        for mirror_url in OVERPASS_MIRRORS:
+            self._log(f"Querying land cover [3/3] OpenStreetMap Overpass ({mirror_url.split('/')[2]})...")
+            try:
+                r = requests.post(
+                    mirror_url,
+                    data={"data": query},
+                    headers=HEADERS,
+                    timeout=self.TIMEOUT,
+                )
+                # Guard: some error responses return HTML instead of JSON
+                ct = r.headers.get("Content-Type", "")
+                if r.status_code != 200 or "html" in ct.lower():
+                    self._log(f"Overpass non-JSON response (HTTP {r.status_code}) — trying next mirror")
+                    continue
+                elements = r.json().get("elements", [])
+                for el in reversed(elements):  # reversed = smallest/most specific area first
+                    tags = el.get("tags", {})
+                    for osm_key in ("landuse", "natural"):
+                        val = tags.get(osm_key, "").lower()
+                        if val in OSM_TO_NLCD:
+                            code = OSM_TO_NLCD[val]
+                            self._log(f"OSM {osm_key}={val} -> NLCD {code}: "
+                                      f"{NLCD_FUEL_MODELS[code]['name']} (Overpass)")
+                            self._cache[cache_key] = code
+                            return code
+                self._log("Overpass: no landuse/natural tag found at this point")
+                break   # got a valid response, just no matching tag — no point trying mirror
+            except Exception as e:
+                self._log(f"Overpass mirror failed ({type(e).__name__}) — trying next")
+
+        # -- All three failed -> manual picker -----------------------------
+        self._cdl_failed = True
+        self._log("All 3 land cover sources unreachable -- will prompt manually")
+        return DEFAULT_NLCD
 
     # -- 2. Soil data via USDA SDM Tabular REST --------------------------------
     def query_soils(self, lat: float, lon: float) -> dict:
@@ -379,19 +496,18 @@ class IndianaMapClient:
     # ── Interactive terrain picker (used when APIs are unreachable) ──────────
     @staticmethod
     def _pick_land_cover() -> int:
-        """Show a numbered menu of common terrain types and return CDL code."""
-        # Curated shortlist — covers the cases that actually matter for fire spread
+        """Show a numbered menu of common terrain types and return NLCD code."""
         MENU = [
-            (5,   "Soybeans               (mult x0.90 — moderate)"),
-            (1,   "Corn                   (mult x0.80 — low, wet)"),
-            (24,  "Winter Wheat / stubble (mult x1.50 — HIGH risk)"),
-            (61,  "Fallow / idle cropland (mult x1.60 — HIGH risk)"),
-            (176, "Grassland / pasture    (mult x1.40 — high)"),
-            (37,  "Hay / non-alfalfa      (mult x1.30 — medium-high)"),
-            (141, "Deciduous forest       (mult x1.20 — medium)"),
-            (142, "Evergreen forest       (mult x1.80 — CRITICAL)"),
-            (111, "Open water / wetland   (mult x0.00 — no spread)"),
-            (121, "Developed / urban      (mult x0.30 — low)"),
+            (82,  "Cultivated Crops       (mult x1.10 — medium)"),
+            (81,  "Hay / Pasture          (mult x1.30 — medium-high)"),
+            (71,  "Grassland / Herbaceous (mult x1.40 — high)"),
+            (52,  "Shrub / Scrub          (mult x1.60 — high)"),
+            (41,  "Deciduous Forest       (mult x1.20 — medium)"),
+            (42,  "Evergreen Forest       (mult x1.80 — CRITICAL)"),
+            (43,  "Mixed Forest           (mult x1.50 — high)"),
+            (31,  "Barren / Fallow        (mult x0.10 — low)"),
+            (11,  "Open Water / Wetland   (mult x0.00 — no spread)"),
+            (21,  "Developed / Open Space (mult x0.30 — low)"),
         ]
         print("\n  +-- Land Cover / Fuel Model (API unavailable) --------------------")
         for i, (code, label) in enumerate(MENU, 1):
@@ -400,7 +516,7 @@ class IndianaMapClient:
         while True:
             raw = input("  Select [1]: ").strip()
             if not raw:
-                return MENU[0][0]
+                return MENU[0][0]  # Cultivated Crops default
             try:
                 idx = int(raw) - 1
                 if 0 <= idx < len(MENU):
@@ -442,29 +558,29 @@ class IndianaMapClient:
 
     def build_terrain_profile(self, lat: float, lon: float) -> TerrainProfile:
         """
-        Queries USDA CropScape, USDA SDM, and USGS NHD.
+        Queries USGS MRLC NLCD WMS, USDA SDM, and USGS NHD.
         If any service is unreachable, drops into an interactive picker
         so the operator always gets a meaningful terrain profile.
         """
         print(f"\n  +--- Terrain Fetch (USDA/USGS APIs) --- ({lat:.4f}N, {abs(lon):.4f}W) --")
 
-        cdl  = self.query_land_cover(lat, lon)
+        nlcd = self.query_land_cover(lat, lon)
         soil = self.query_soils(lat, lon)
         water = self.query_water_nearby(lat, lon)
 
         # ── Manual override when APIs were unreachable ─────────────────────
         if self._cdl_failed:
-            print("  [!] CropScape offline — please select terrain manually:")
-            cdl = self._pick_land_cover()
+            print("  [!] Land cover API offline — please select terrain manually:")
+            nlcd = self._pick_land_cover()
 
         if self._soil_failed:
             print("  [!] Soil API offline — please select drainage class manually:")
             soil = self._pick_soil()
 
-        fuel_data = CDL_FUEL_MODELS.get(cdl, CDL_FUEL_MODELS[DEFAULT_CDL])
+        fuel_data = NLCD_FUEL_MODELS.get(nlcd, NLCD_FUEL_MODELS[DEFAULT_NLCD])
 
         profile = TerrainProfile(
-            nlcd_code       = cdl,
+            nlcd_code       = nlcd,
             land_cover_name = fuel_data["name"],
             fuel_mult       = fuel_data["mult"],
             soil_name       = soil["name"],
@@ -476,7 +592,7 @@ class IndianaMapClient:
             lat=lat, lon=lon,
         )
         print(f"  |")
-        print(f"  |  * Crop/Cover   : {profile.land_cover_name}  (CDL {cdl})")
+        print(f"  |  * Land Cover  : {profile.land_cover_name}  (NLCD {nlcd})")
         print(f"  |  * Base Mult    : {profile.fuel_mult:.2f}  ->  Effective: {profile.effective_mult():.2f}")
         print(f"  |  * Soil         : {profile.soil_name[:40]}")
         print(f"  |  * Drainage     : {profile.drainage_class}  (moisture {profile.soil_moisture:.0%})")
