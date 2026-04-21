@@ -16,9 +16,15 @@
 """
 
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.patches import Ellipse
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+# Use a cross-platform font stack so Windows doesn't warn about missing glyphs
+matplotlib.rcParams['font.family'] = 'sans-serif'
+matplotlib.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans', 'Liberation Sans', 'Helvetica']
 import requests
 import json
 import csv
@@ -27,12 +33,12 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional, List
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # NLCD FUEL MODEL TABLE
 # Maps National Land Cover Database codes to Rothermel-style fire parameters.
 # Critical for Indiana agricultural landscapes:
 #   Code 81 = Hay/Pasture, 82 = Cultivated Crops (dominant in Indiana)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 NLCD_FUEL_MODELS = {
     11: {"name": "Open Water",            "mult": 0.00, "color": "#4472C4", "risk": "none"},
     21: {"name": "Developed - Open",      "mult": 0.30, "color": "#D47070", "risk": "low"},
@@ -51,6 +57,46 @@ NLCD_FUEL_MODELS = {
     95: {"name": "Herbaceous Wetlands",   "mult": 0.60, "color": "#A6CEE3", "risk": "low"},
 }
 DEFAULT_NLCD = 82  # Cultivated Crops — most common in Indiana
+
+# -----------------------------------------------------------------------------
+# CDL FUEL MODEL TABLE  (USDA CropScape / Cropland Data Layer codes)
+# CropScape uses different codes from NLCD. Indiana top crops: corn(1),
+# soybeans(5), winter wheat(24), alfalfa(36), hay(37).
+# -----------------------------------------------------------------------------
+CDL_FUEL_MODELS = {
+    1:   {"name": "Corn",                  "mult": 0.80, "risk": "low"},     # standing corn = wet
+    2:   {"name": "Cotton",                "mult": 1.00, "risk": "medium"},
+    3:   {"name": "Rice",                  "mult": 0.20, "risk": "none"},    # flooded fields
+    4:   {"name": "Sorghum",               "mult": 1.10, "risk": "medium"},
+    5:   {"name": "Soybeans",              "mult": 0.90, "risk": "medium"},
+    6:   {"name": "Sunflower",             "mult": 1.30, "risk": "medium"},
+    21:  {"name": "Barley",                "mult": 1.40, "risk": "high"},
+    22:  {"name": "Durum Wheat",           "mult": 1.40, "risk": "high"},
+    23:  {"name": "Spring Wheat",          "mult": 1.40, "risk": "high"},
+    24:  {"name": "Winter Wheat",          "mult": 1.50, "risk": "high"},    # dry stubble
+    26:  {"name": "Dbl Crop WinWht/Soy",  "mult": 1.20, "risk": "medium"},
+    27:  {"name": "Rye",                   "mult": 1.35, "risk": "medium"},
+    28:  {"name": "Oats",                  "mult": 1.30, "risk": "medium"},
+    36:  {"name": "Alfalfa",               "mult": 1.10, "risk": "medium"},
+    37:  {"name": "Other Hay/Non-Alfalfa", "mult": 1.30, "risk": "medium"},  # ← Indiana Ag
+    59:  {"name": "Sod/Grass Seed",        "mult": 1.20, "risk": "medium"},
+    61:  {"name": "Fallow/Idle Cropland",  "mult": 1.60, "risk": "high"},    # dry residue
+    111: {"name": "Open Water",            "mult": 0.00, "risk": "none"},
+    121: {"name": "Developed/Open Space",  "mult": 0.30, "risk": "low"},
+    122: {"name": "Developed/Low",         "mult": 0.20, "risk": "low"},
+    123: {"name": "Developed/Medium",      "mult": 0.10, "risk": "low"},
+    124: {"name": "Developed/High",        "mult": 0.05, "risk": "low"},
+    131: {"name": "Barren",                "mult": 0.10, "risk": "low"},
+    141: {"name": "Deciduous Forest",      "mult": 1.20, "risk": "medium"},
+    142: {"name": "Evergreen Forest",      "mult": 1.80, "risk": "high"},
+    143: {"name": "Mixed Forest",          "mult": 1.50, "risk": "high"},
+    152: {"name": "Shrubland",             "mult": 1.60, "risk": "high"},
+    176: {"name": "Grassland/Pasture",     "mult": 1.40, "risk": "high"},    # ← Indiana Ag
+    190: {"name": "Woody Wetlands",        "mult": 0.40, "risk": "low"},
+    195: {"name": "Herbaceous Wetlands",   "mult": 0.60, "risk": "low"},
+}
+DEFAULT_CDL = 5   # Soybeans — #1 Indiana crop by area (alternates with corn)
+
 
 RISK_COLORS = {
     "none":     "#4472C4",
@@ -89,9 +135,9 @@ def latlon_to_utm16n(lat: float, lon: float):
     return x, y
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # DATA CLASSES
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 @dataclass
 class TerrainProfile:
     """Encapsulates all terrain / fuel data fetched from IndianaMap."""
@@ -135,101 +181,99 @@ class AlertEvent:
     message: str
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # INDIANAMAP CLIENT
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 class IndianaMapClient:
     """
-    Queries live IndianaMap ArcGIS REST services for:
-      • NLCD Land Cover 2006  → fuel model
-      • SSURGO Soils 2019     → soil moisture / drainage
-      • NHD Water Bodies      → firebreak detection
+    Fetches terrain/agriculture data from publicly accessible federal APIs:
 
-    All endpoints are public, no API key required.
-    Coordinate system: EPSG:26916 (UTM Zone 16N) as required by maps.indiana.edu.
+      1. USDA CropScape (NASS)  — crop/land-cover type at a lat/lon point
+         https://nassgeodata.gmu.edu/axis2/services/CDLService/GetCDLValue
+         CDL codes differ from NLCD; see CDL_FUEL_MODELS below.
+
+      2. USDA SSURGO via SDM Tabular Service (NRCS)  — soil drainage class
+         https://SDMDataAccess.nrcs.usda.gov/tabular/post.rest
+         Spatial query: map-unit polygon that contains the point.
+
+      3. USGS StreamStats / NHD  — water body proximity
+         https://streamstats.usgs.gov/regressionservices/
+
+      4. USGS EPQS (updated URL)  — elevation
+         https://epqs.nationalmap.gov/v1/json
+
+    All endpoints are free, public-domain, no API key required.
+    maps.indiana.edu has been removed — that server is offline.
     """
 
-    BASE = "https://maps.indiana.edu/arcgis/rest/services"
+    # USDA CropScape REST point-query  (returns CDL crop code at x/y WGS84)
+    CROPSCAPE_URL = "https://nassgeodata.gmu.edu/axis2/services/CDLService/GetCDLValue"
 
-    # Confirmed REST endpoints from IndianaMap (maps.indiana.edu)
-    LAND_COVER_SVC = f"{BASE}/Environment/Land_Cover_2006/MapServer"
-    SOILS_SVC      = f"{BASE}/Environment/Soils_SSURGO_Soil_Survey/MapServer"
-    WATER_SVC      = f"{BASE}/Hydrology/Water_Bodies_Lakes_LocalRes/MapServer"
+    # USDA SSURGO / Soil Data Mart tabular REST  (accepts SQL, returns JSON)
+    SDM_URL       = "https://SDMDataAccess.nrcs.usda.gov/tabular/post.rest"
 
-    # USGS Elevation Point Query (national service, no auth needed)
-    USGS_ELEV      = "https://nationalmap.gov/epqs/pqs.php"
+    # USGS Elevation Point Query Service (updated URL, replaces nationalmap.gov/epqs)
+    USGS_ELEV     = "https://epqs.nationalmap.gov/v1/json"
 
-    TIMEOUT = 12
+    # USGS NHD REST  (National Hydrography Dataset — water bodies)
+    NHD_URL       = "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer"
+
+    TIMEOUT = 6    # seconds — fail fast; all three sources have reliable fallbacks
 
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
         self._cache: dict = {}
+        self._cdl_failed  = False   # set True when CropScape is unreachable
+        self._soil_failed  = False   # set True when SDM is unreachable
 
     def _log(self, msg: str):
         if self.verbose:
-            print(f"  │  {msg}")
+            print(f"  |  {msg}")
 
-    def _identify(self, service_url: str, utm_x: float, utm_y: float,
-                  pad: float = 200.0) -> Optional[dict]:
-        """Call ArcGIS Identify at UTM point, return first result or None."""
-        params = {
-            "geometry":      json.dumps({"x": utm_x, "y": utm_y,
-                                         "spatialReference": {"wkid": 26916}}),
-            "geometryType":  "esriGeometryPoint",
-            "sr":            "26916",
-            "layers":        "all",
-            "tolerance":     "5",
-            "mapExtent":     f"{utm_x-pad},{utm_y-pad},{utm_x+pad},{utm_y+pad}",
-            "imageDisplay":  "400,400,96",
-            "returnGeometry":"false",
-            "f":             "json",
-        }
-        try:
-            r = requests.get(f"{service_url}/identify", params=params, timeout=self.TIMEOUT)
-            data = r.json()
-            results = data.get("results", [])
-            return results[0] if results else None
-        except Exception as e:
-            self._log(f"Identify failed ({service_url.split('/')[-2]}): {e}")
-            return None
-
+    # -- 1. Land Cover via USDA CropScape -------------------------------------
     def query_land_cover(self, lat: float, lon: float) -> int:
-        """Return NLCD code at location from IndianaMap Land Cover service."""
-        key = f"nlcd_{lat:.4f}_{lon:.4f}"
+        """
+        Query USDA CropScape for the Cropland Data Layer (CDL) code at (lat, lon).
+        CDL is updated annually; codes are crop-specific (corn=1, soybeans=5, …).
+        Returns an integer CDL code; see CDL_FUEL_MODELS for the full table.
+        Falls back to DEFAULT_CDL on any error.
+        """
+        key = f"cdl_{lat:.4f}_{lon:.4f}"
         if key in self._cache:
             return self._cache[key]
 
-        self._log("Querying Land Cover (NLCD 2006)...")
-        ux, uy = latlon_to_utm16n(lat, lon)
-        result = self._identify(self.LAND_COVER_SVC, ux, uy)
+        self._log("Querying crop type (USDA CropScape / CDL 2023)...")
+        try:
+            r = requests.get(
+                self.CROPSCAPE_URL,
+                params={"year": "2023", "x": str(lon), "y": str(lat), "format": "json"},
+                timeout=self.TIMEOUT,
+            )
+            # CropScape returns: {"category":"Soybeans","value":"5"}
+            data = r.json()
+            code = int(data.get("value", DEFAULT_CDL))
+            name = data.get("category", CDL_FUEL_MODELS.get(code, {}).get("name", "Unknown"))
+            if code in CDL_FUEL_MODELS:
+                self._log(f"CDL code {code}: {name}")
+                self._cache[key] = code
+                return code
+            else:
+                self._log(f"CDL code {code} ({name}) not in fuel table — using default")
+        except Exception as e:
+            self._log(f"CropScape unreachable: {type(e).__name__}")
+            self._cdl_failed = True
 
-        if result:
-            attrs = result.get("attributes", {})
-            # NLCD layer exposes pixel value under several possible field names
-            for field in ("Pixel Value", "Value", "NLCD_Land", "gridcode", "CLASS"):
-                if field in attrs:
-                    try:
-                        code = int(float(str(attrs[field]).strip()))
-                        if code in NLCD_FUEL_MODELS:
-                            self._log(f"Land cover → NLCD {code}: {NLCD_FUEL_MODELS[code]['name']}")
-                            self._cache[key] = code
-                            return code
-                    except (ValueError, TypeError):
-                        continue
+        self._log(f"Defaulting to CDL {DEFAULT_CDL} ({CDL_FUEL_MODELS[DEFAULT_CDL]['name']})")
+        return DEFAULT_CDL
 
-        self._log(f"Land cover lookup miss — defaulting to NLCD {DEFAULT_NLCD} (Cultivated Crops)")
-        return DEFAULT_NLCD
-
+    # -- 2. Soil data via USDA SDM Tabular REST --------------------------------
     def query_soils(self, lat: float, lon: float) -> dict:
         """
-        Return soil attributes from IndianaMap SSURGO Soil Survey.
-        Key attrs: MAPUNIT_NA (map-unit name), DRCLASSDCD (drainage class),
-                   HYDCLPRS (hydric rating), FORPEHRTDC (erosion hazard).
+        Query USDA Soil Data Mart (SDM) for the dominant soil component at point.
+        Uses a spatial SQL query against the SSURGO mapunit table.
+        Returns drainage class, hydric flag, and a moisture proxy.
         """
-        self._log("Querying Soils (SSURGO 2019)...")
-        ux, uy = latlon_to_utm16n(lat, lon)
-        result = self._identify(self.SOILS_SVC, ux, uy)
-
+        self._log("Querying soils (USDA SSURGO / SDM Tabular)...")
         defaults = {
             "name": "Silty Clay Loam (Indiana default)",
             "drainage": "Well drained",
@@ -237,67 +281,190 @@ class IndianaMapClient:
             "moisture": 0.35,
         }
 
-        if not result:
-            return defaults
+        # SDM tabular SQL: find dominant component for the map unit containing point
+        sql = (
+            f"SELECT TOP 1 co.compname, co.drainagecl, co.hydricrating "
+            f"FROM mapunit mu "
+            f"INNER JOIN component co ON mu.mukey = co.mukey "
+            f"INNER JOIN mupolygon mp ON mu.mukey = mp.mukey "
+            f"WHERE co.majcompflag = 'Yes' "
+            f"AND mp.mupolygongeo.STContains("
+            f"geometry::STGeomFromText('POINT({lon} {lat})', 4326)) = 1 "
+            f"ORDER BY co.comppct_r DESC"
+        )
+        try:
+            r = requests.post(
+                self.SDM_URL,
+                data={"format": "JSON+COLUMNNAME", "query": sql},
+                timeout=self.TIMEOUT,
+            )
+            rows = r.json().get("Table", [])
+            if len(rows) >= 2:   # row 0 = column names, row 1 = first data row
+                cols = rows[0]
+                vals = rows[1]
+                row  = dict(zip(cols, vals))
+                name   = str(row.get("compname",    defaults["name"]))
+                drain  = str(row.get("drainagecl",  defaults["drainage"]))
+                hydric = str(row.get("hydricrating", "No"))
+                hydric_flag = "Y" if hydric.lower() in ("yes", "y") else "N"
 
-        attrs = result.get("attributes", {})
-        name    = str(attrs.get("MAPUNIT_NA", attrs.get("Soil Name", "Unknown"))).strip()
-        drain   = str(attrs.get("DRCLASSDCD", "Well drained")).strip()
-        hydric  = str(attrs.get("HYDCLPRS",   "N")).strip()
+                drain_moisture = {
+                    "Excessively drained":          0.05,
+                    "Somewhat excessively drained": 0.12,
+                    "Well drained":                 0.25,
+                    "Moderately well drained":      0.40,
+                    "Somewhat poorly drained":      0.55,
+                    "Poorly drained":               0.70,
+                    "Very poorly drained":          0.85,
+                }
+                moisture = drain_moisture.get(drain, 0.35)
+                self._log(f"Soil: {name} | {drain} | Hydric: {hydric_flag} | Moisture: {moisture:.0%}")
+                return {"name": name, "drainage": drain, "hydric": hydric_flag, "moisture": moisture}
+        except Exception as e:
+            self._log(f"SDM unreachable: {type(e).__name__}")
+            self._soil_failed = True
 
-        # Map SSURGO drainage class to moisture proxy
-        drain_moisture = {
-            "Excessively drained":    0.05,
-            "Somewhat excessively drained": 0.12,
-            "Well drained":           0.25,
-            "Moderately well drained":0.40,
-            "Somewhat poorly drained":0.55,
-            "Poorly drained":         0.70,
-            "Very poorly drained":    0.85,
-        }
-        moisture = drain_moisture.get(drain, 0.35)
+        self._log("Using Indiana default soil profile")
+        return defaults
 
-        self._log(f"Soil → {name} | Drainage: {drain} | Hydric: {hydric} | Moisture: {moisture:.0%}")
-        return {"name": name, "drainage": drain, "hydric": hydric, "moisture": moisture}
+    # -- 3. Water body proximity via USGS NHD ----------------------------------
+    def query_water_nearby(self, lat: float, lon: float, buffer_deg: float = 0.005) -> bool:
+        """
+        Query USGS National Hydrography Dataset REST service for water bodies
+        within ~500 m of the point (0.005° ≈ 500 m at Indiana latitudes).
+        """
+        self._log("Checking water bodies (USGS NHD)...")
+        xmin = lon - buffer_deg; xmax = lon + buffer_deg
+        ymin = lat - buffer_deg; ymax = lat + buffer_deg
+        try:
+            r = requests.get(
+                f"{self.NHD_URL}/0/query",    # layer 0 = NHDArea (water bodies)
+                params={
+                    "geometry":     f"{xmin},{ymin},{xmax},{ymax}",
+                    "geometryType": "esriGeometryEnvelope",
+                    "inSR":         "4326",
+                    "spatialRel":   "esriSpatialRelIntersects",
+                    "returnCountOnly": "true",
+                    "f":            "json",
+                },
+                timeout=self.TIMEOUT,
+            )
+            count = r.json().get("count", 0)
+            found = count > 0
+            self._log(f"Water bodies found: {'YES ({count} features — spread reduced)' if found else 'No'}")
+            return found
+        except Exception as e:
+            self._log(f"NHD water query failed: {e}")
+            return False
 
-    def query_water_nearby(self, lat: float, lon: float, buffer_m: float = 500) -> bool:
-        """Check for lakes/ponds/wetlands within buffer using NHD Water Bodies layer."""
-        self._log(f"Checking water bodies within {buffer_m:.0f}m (NHD)...")
-        ux, uy = latlon_to_utm16n(lat, lon)
-        result = self._identify(self.WATER_SVC, ux, uy, pad=buffer_m)
-        found = result is not None
-        self._log(f"Water body found: {'YES — reduces spread' if found else 'No'}")
-        return found
-
+    # -- 4. Elevation via USGS EPQS --------------------------------------------
     def query_elevation(self, lat: float, lon: float) -> Optional[float]:
-        """USGS Elevation Point Query Service — returns metres."""
+        """USGS Elevation Point Query Service — returns elevation in metres."""
         self._log("Querying elevation (USGS EPQS)...")
         try:
-            r = requests.get(self.USGS_ELEV,
-                             params={"x": lon, "y": lat, "units": "Meters", "output": "json"},
-                             timeout=self.TIMEOUT)
-            elev = float(r.json()["USGS_Elevation_Point_Query_Service"]
-                                  ["Elevation_Query"]["Elevation"])
+            r = requests.get(
+                self.USGS_ELEV,
+                params={"x": lon, "y": lat, "units": "Meters",
+                        "wkid": "4326", "includeDate": "false"},
+                timeout=self.TIMEOUT,
+            )
+            elev = float(r.json()["value"])
             self._log(f"Elevation: {elev:.1f} m ASL")
             return elev
         except Exception as e:
             self._log(f"Elevation query failed: {e}")
             return None
 
+    # -- Assemble TerrainProfile -----------------------------------------------
+    # ── Interactive terrain picker (used when APIs are unreachable) ──────────
+    @staticmethod
+    def _pick_land_cover() -> int:
+        """Show a numbered menu of common terrain types and return CDL code."""
+        # Curated shortlist — covers the cases that actually matter for fire spread
+        MENU = [
+            (5,   "Soybeans               (mult x0.90 — moderate)"),
+            (1,   "Corn                   (mult x0.80 — low, wet)"),
+            (24,  "Winter Wheat / stubble (mult x1.50 — HIGH risk)"),
+            (61,  "Fallow / idle cropland (mult x1.60 — HIGH risk)"),
+            (176, "Grassland / pasture    (mult x1.40 — high)"),
+            (37,  "Hay / non-alfalfa      (mult x1.30 — medium-high)"),
+            (141, "Deciduous forest       (mult x1.20 — medium)"),
+            (142, "Evergreen forest       (mult x1.80 — CRITICAL)"),
+            (111, "Open water / wetland   (mult x0.00 — no spread)"),
+            (121, "Developed / urban      (mult x0.30 — low)"),
+        ]
+        print("\n  +-- Land Cover / Fuel Model (API unavailable) --------------------")
+        for i, (code, label) in enumerate(MENU, 1):
+            print(f"  |  {i:2d}. {label}")
+        print("  +------------------------------------------------------------------")
+        while True:
+            raw = input("  Select [1]: ").strip()
+            if not raw:
+                return MENU[0][0]
+            try:
+                idx = int(raw) - 1
+                if 0 <= idx < len(MENU):
+                    return MENU[idx][0]
+            except ValueError:
+                pass
+            print("  [!] Enter a number 1–10")
+
+    @staticmethod
+    def _pick_soil() -> dict:
+        """Show a drainage-class menu and return a soil dict."""
+        MENU = [
+            ("Well drained",           0.25, "N", "Sandy Loam / Silt Loam"),
+            ("Moderately well drained", 0.40, "N", "Silt Loam / Loam"),
+            ("Somewhat poorly drained", 0.55, "N", "Silty Clay Loam"),
+            ("Poorly drained",          0.70, "Y", "Silty Clay / Muck (hydric)"),
+            ("Excessively drained",     0.05, "N", "Loamy Sand / Gravelly"),
+        ]
+        print("\n  +-- Soil Drainage Class (API unavailable) ------------------------")
+        for i, (drain, moist, hydric, name) in enumerate(MENU, 1):
+            hydric_note = "  [hydric]" if hydric == "Y" else ""
+            print(f"  |  {i}. {drain:<32} moisture ~{moist:.0%}{hydric_note}")
+        print("  +------------------------------------------------------------------")
+        while True:
+            raw = input("  Select [1]: ").strip()
+            if not raw:
+                choice = MENU[0]
+                break
+            try:
+                idx = int(raw) - 1
+                if 0 <= idx < len(MENU):
+                    choice = MENU[idx]
+                    break
+            except ValueError:
+                pass
+            print("  [!] Enter a number 1–5")
+        drain, moist, hydric, name = choice
+        return {"name": name, "drainage": drain, "hydric": hydric, "moisture": moist}
+
     def build_terrain_profile(self, lat: float, lon: float) -> TerrainProfile:
         """
-        Compose a full TerrainProfile from multiple IndianaMap queries.
-        Falls back gracefully if any service is unavailable.
+        Queries USDA CropScape, USDA SDM, and USGS NHD.
+        If any service is unreachable, drops into an interactive picker
+        so the operator always gets a meaningful terrain profile.
         """
-        print(f"\n  ┌─── IndianaMap Terrain Fetch ─── ({lat:.4f}°N, {abs(lon):.4f}°W) ──────────")
+        print(f"\n  +--- Terrain Fetch (USDA/USGS APIs) --- ({lat:.4f}N, {abs(lon):.4f}W) --")
 
-        nlcd      = self.query_land_cover(lat, lon)
-        fuel_data = NLCD_FUEL_MODELS.get(nlcd, NLCD_FUEL_MODELS[DEFAULT_NLCD])
-        soil      = self.query_soils(lat, lon)
-        water     = self.query_water_nearby(lat, lon)
+        cdl  = self.query_land_cover(lat, lon)
+        soil = self.query_soils(lat, lon)
+        water = self.query_water_nearby(lat, lon)
+
+        # ── Manual override when APIs were unreachable ─────────────────────
+        if self._cdl_failed:
+            print("  [!] CropScape offline — please select terrain manually:")
+            cdl = self._pick_land_cover()
+
+        if self._soil_failed:
+            print("  [!] Soil API offline — please select drainage class manually:")
+            soil = self._pick_soil()
+
+        fuel_data = CDL_FUEL_MODELS.get(cdl, CDL_FUEL_MODELS[DEFAULT_CDL])
 
         profile = TerrainProfile(
-            nlcd_code       = nlcd,
+            nlcd_code       = cdl,
             land_cover_name = fuel_data["name"],
             fuel_mult       = fuel_data["mult"],
             soil_name       = soil["name"],
@@ -308,25 +475,25 @@ class IndianaMapClient:
             risk_level      = fuel_data["risk"],
             lat=lat, lon=lon,
         )
-        print(f"  │")
-        print(f"  │  ● Land Cover  : {profile.land_cover_name}  (NLCD {nlcd})")
-        print(f"  │  ● Base Mult   : {profile.fuel_mult:.2f}  →  Effective: {profile.effective_mult():.2f}")
-        print(f"  │  ● Soil        : {profile.soil_name[:40]}")
-        print(f"  │  ● Drainage    : {profile.drainage_class}  (moisture {profile.soil_moisture:.0%})")
-        print(f"  │  ● Hydric Soil : {profile.hydric_rating}  (wetland penalty applied if Y)")
-        print(f"  │  ● Water Nearby: {'YES' if water else 'No'}")
-        print(f"  │  ● Risk Level  : {profile.risk_level.upper()}")
-        print(f"  └────────────────────────────────────────────────────────────────────\n")
+        print(f"  |")
+        print(f"  |  * Crop/Cover   : {profile.land_cover_name}  (CDL {cdl})")
+        print(f"  |  * Base Mult    : {profile.fuel_mult:.2f}  ->  Effective: {profile.effective_mult():.2f}")
+        print(f"  |  * Soil         : {profile.soil_name[:40]}")
+        print(f"  |  * Drainage     : {profile.drainage_class}  (moisture {profile.soil_moisture:.0%})")
+        print(f"  |  * Hydric Soil  : {profile.hydric_rating}  (wetland penalty if Y)")
+        print(f"  |  * Water Nearby : {'YES -- spread penalty applied' if water else 'No'}")
+        print(f"  |  * Risk Level   : {profile.risk_level.upper()}")
+        print(f"  +-------------------------------------------------------------------\n")
         return profile
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 5-STATE EXTENDED KALMAN FILTER  [cx, cy, a, b, θ]
 #   cx, cy  — fire centroid (m)
 #   a       — semi-major axis (head-fire direction, m)
 #   b       — semi-minor axis (flanking fire, m)
 #   θ       — ellipse orientation (radians, = wind direction)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 class FireKalmanFilter:
     # NIS chi-squared 95th percentile for dof=3 measurements
     NIS_95     = 7.815
@@ -339,7 +506,7 @@ class FireKalmanFilter:
         self.R_base = np.diag([4.0, 4.0, 7.0])
         self._nis_history: List[float] = []   # rolling NIS values
 
-    # ── accessors ──────────────────────────────────────────────────────────
+    # -- accessors ----------------------------------------------------------
     @property
     def cx(self): return float(self.x[0, 0])
     @property
@@ -393,7 +560,7 @@ class FireKalmanFilter:
         """Latest NIS value, or None if no observations yet."""
         return self._nis_history[-1] if self._nis_history else None
 
-    # ── Kalman predict step ─────────────────────────────────────────────────
+    # -- Kalman predict step -------------------------------------------------
     def predict(self, dx: float, dy: float, da: float, db: float, theta: float):
         self.x[0, 0] += dx
         self.x[1, 0] += dy
@@ -402,7 +569,7 @@ class FireKalmanFilter:
         self.x[4, 0]  = theta
         self.P        = self.P + self.Q
 
-    # ── Kalman update step ──────────────────────────────────────────────────
+    # -- Kalman update step --------------------------------------------------
     def update(self, obs: DroneObservation):
         """
         Standard KF update with pre-fit NIS computation.
@@ -437,11 +604,11 @@ class FireKalmanFilter:
         self.x[3, 0] = max(self.x[3, 0], 0.5)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # ROTHERMEL + ANDREWS FIRE SPREAD MODEL
 # Computes elliptical spread deltas for the KF predict step.
 # Ref: Andrews (1986) — length-to-breadth ratio from wind speed.
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 class FireSpreadModel:
     BASE_ROS = 0.14          # m/s baseline rate-of-spread (dry Indiana cropland)
     MAX_LB   = 8.0           # maximum length-to-breadth ratio
@@ -489,9 +656,9 @@ class FireSpreadModel:
         return dx, dy, da, db, theta
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # RISK ASSESSOR
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 class RiskAssessor:
     def __init__(self):
         self.alerts: List[AlertEvent] = []
@@ -514,9 +681,9 @@ class RiskAssessor:
         return lvl
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # FERDA v2.0 — MAIN SYSTEM
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 class FERDA_System:
     def __init__(self, ix: float, iy: float, ir: float, terrain: TerrainProfile):
         self.kf           = FireKalmanFilter(ix, iy, ir)
@@ -534,7 +701,7 @@ class FERDA_System:
 
         self._build_figure()
 
-    # ── FIGURE ───────────────────────────────────────────────────────────────
+    # -- FIGURE ---------------------------------------------------------------
     def _build_figure(self):
         plt.ion()
         self.fig = plt.figure(figsize=(19, 9), facecolor="#13132a")
@@ -557,7 +724,7 @@ class FERDA_System:
             ax.xaxis.label.set_color("#9999bb")
             ax.yaxis.label.set_color("#9999bb")
 
-        # ── Map panel ────────────────────────────────────────────────────────
+        # -- Map panel --------------------------------------------------------
         SPAN = 650
         self.ax_map.set_xlim(-80, SPAN)
         self.ax_map.set_ylim(-80, SPAN)
@@ -570,10 +737,10 @@ class FERDA_System:
         risk_col = RISK_COLORS.get(self.terrain.risk_level, "#FFC000")
         self.ax_map.text(
             0.01, 0.995,
-            f"🌱 {self.terrain.land_cover_name}  ·  Soil: {self.terrain.soil_name[:28]}\n"
+            f"[crop] {self.terrain.land_cover_name}  ·  Soil: {self.terrain.soil_name[:28]}\n"
             f"Fuel ×{self.terrain.fuel_mult:.1f}  ·  Effective ×{self.terrain.effective_mult():.2f}"
             f"  ·  Moisture {self.terrain.soil_moisture:.0%}"
-            + ("  ·  ⚠ Water barrier" if self.terrain.has_water_nearby else ""),
+            + ("  ·  ! Water barrier" if self.terrain.has_water_nearby else ""),
             transform=self.ax_map.transAxes, fontsize=7.8, va="top",
             color="#ccccee",
             bbox=dict(facecolor="#1e1e3a", edgecolor=risk_col, alpha=0.92, pad=3),
@@ -625,7 +792,7 @@ class FERDA_System:
             facecolor="#1e1e3a", edgecolor="#444466", labelcolor="#ccccee",
         )
 
-        # ── Growth chart ─────────────────────────────────────────────────────
+        # -- Growth chart -----------------------------------------------------
         self.ax_growth.set_title("Fire Axes (m)", color="#ccccee", fontsize=8, pad=3)
         self.ax_growth.set_xlabel("Time (s)", fontsize=7)
         self.ax_growth.grid(True, alpha=0.18, color="#33335a")
@@ -635,13 +802,13 @@ class FERDA_System:
         self.ax_growth.legend(facecolor="#0d0d1f", edgecolor="#33335a",
                                labelcolor="#ccccee", fontsize=6.5)
 
-        # ── Area chart ───────────────────────────────────────────────────────
+        # -- Area chart -------------------------------------------------------
         self.ax_area.set_title("Fire Area (ha)", color="#ccccee", fontsize=8, pad=3)
         self.ax_area.set_xlabel("Time (s)", fontsize=7)
         self.ax_area.grid(True, alpha=0.18, color="#33335a")
         self.ln_area, = self.ax_area.plot([], [], color="#9B00FF", lw=1.5)
 
-        # ── Alerts panel ──────────────────────────────────────────────────────
+        # -- Alerts panel ------------------------------------------------------
         self.ax_alerts.axis("off")
         self.ax_alerts.set_title("System Alerts & State", color="#ccccee",
                                   fontsize=8.5, pad=6)
@@ -651,7 +818,7 @@ class FERDA_System:
             linespacing=1.55,
         )
 
-    # ── PREDICT ──────────────────────────────────────────────────────────────
+    # -- PREDICT --------------------------------------------------------------
     def predict(self, dt: float, wind_speed: float, wind_dir: float, slope: float):
         self.wind_speed = wind_speed
         self.wind_dir   = wind_dir
@@ -661,13 +828,13 @@ class FERDA_System:
         self.current_time += dt
         self._record()
 
-    # ── UPDATE ───────────────────────────────────────────────────────────────
+    # -- UPDATE ---------------------------------------------------------------
     def update(self, obs: DroneObservation):
         obs.timestamp = self.current_time
         self.observations.append(obs)
         self.kf.update(obs)
 
-    # ── RENDER ───────────────────────────────────────────────────────────────
+    # -- RENDER ---------------------------------------------------------------
     def render(self):
         kf  = self.kf
         ts  = [h["t"] for h in self.history]
@@ -737,7 +904,7 @@ class FERDA_System:
         c_color = "#00FF7F" if conf > 70 else "#FFA500" if conf > 40 else "#FF4444"
         nis_str = f"{kf.last_nis:.1f}" if kf.last_nis is not None else "n/a"
         self.txt_status.set_text(
-            f"⏱  {self.current_time:.0f} s\n"
+            f"[t]  {self.current_time:.0f} s\n"
             f"Conf  {conf:.1f}%   Risk: {risk_lvl.upper()}\n"
             f"NIS   {nis_str}  (expect < 7.8)\n"
             f"CX {kf.cx:.1f} m   CY {kf.cy:.1f} m\n"
@@ -763,7 +930,7 @@ class FERDA_System:
         self.fig.canvas.flush_events()
         plt.pause(0.04)
 
-    # ── HELPERS ──────────────────────────────────────────────────────────────
+    # -- HELPERS --------------------------------------------------------------
     def _record(self):
         kf = self.kf
         self.history.append({
@@ -786,12 +953,12 @@ class FERDA_System:
             w.writerow(["time_s", "cx_m", "cy_m", "semi_major_m", "semi_minor_m",
                          "area_ha", "confidence_pct", "risk_level"])
             w.writerows(self.log_records)
-        print(f"  ✓ Log exported → {path}")
+        print(f"  OK Log exported → {path}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # CLI HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def get_float(prompt: str, default: Optional[float] = None) -> float:
     while True:
         try:
@@ -811,30 +978,30 @@ def print_banner():
     print("═" * 66)
 
 def print_controls():
-    print("\n  ┌─ Runtime Commands ───────────────────────────────────────────┐")
-    print("  │  <Enter>              → auto-step (dt=10 s)                   │")
-    print("  │  x,y,r               → fuse drone observation (Drone 0)       │")
-    print("  │  x,y,r,id            → multi-drone (Drone id)                 │")
-    print("  │  x,y,r,id,conf       → with confidence 0–1                    │")
-    print("  │  env                  → reconfigure wind / slope              │")
-    print("  │  export               → write CSV log                         │")
-    print("  │  quit / Ctrl-C        → exit                                  │")
-    print("  └──────────────────────────────────────────────────────────────┘\n")
+    print("\n  +- Runtime Commands -------------------------------------------+")
+    print("  |  <Enter>              → auto-step (dt=10 s)                   |")
+    print("  |  x,y,r               → fuse drone observation (Drone 0)       |")
+    print("  |  x,y,r,id            → multi-drone (Drone id)                 |")
+    print("  |  x,y,r,id,conf       → with confidence 0–1                    |")
+    print("  |  env                  → reconfigure wind / slope              |")
+    print("  |  export               → write CSV log                         |")
+    print("  |  quit / Ctrl-C        → exit                                  |")
+    print("  +--------------------------------------------------------------+\n")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def main():
     print_banner()
 
-    # ── Step 1: Location ─────────────────────────────────────────────────────
+    # -- Step 1: Location -----------------------------------------------------
     print("\n  [1/3]  Incident location (Indiana WGS84 coordinates)")
     print("         Default: West Lafayette / Tippecanoe County")
     lat = get_float("  Latitude  [40.4259] : ", default=40.4259)
     lon = get_float("  Longitude [-86.9081]: ", default=-86.9081)
 
-    # ── Step 2: IndianaMap terrain fetch ─────────────────────────────────────
+    # -- Step 2: IndianaMap terrain fetch -------------------------------------
     print("\n  [2/3]  Fetching terrain data from IndianaMap...")
     client  = IndianaMapClient(verbose=True)
     terrain = client.build_terrain_profile(lat, lon)
@@ -848,7 +1015,7 @@ def main():
         except ValueError:
             pass
 
-    # ── Step 3: Fire initialisation ──────────────────────────────────────────
+    # -- Step 3: Fire initialisation ------------------------------------------
     print("\n  [3/3]  Initial fire parameters")
     ix = get_float("  Initial X (m) [0]   : ", default=0.0)
     iy = get_float("  Initial Y (m) [0]   : ", default=0.0)
@@ -859,14 +1026,14 @@ def main():
 
     try:
         while True:
-            # ── Environment config ────────────────────────────────────────────
-            print("\n  ─── Environment ─────────────────────────────────────────────")
+            # -- Environment config --------------------------------------------
+            print("\n  --- Environment ---------------------------------------------")
             wind_v = get_float("  Wind Speed (m/s): ")
             wind_d = get_float("  Wind Direction (° from East, CCW): ")
             slope  = get_float("  Slope Angle (°): ")
 
-            # ── Simulation loop ───────────────────────────────────────────────
-            print("\n  ─── Simulation running (type 'env' to reconfigure) ──────────")
+            # -- Simulation loop -----------------------------------------------
+            print("\n  --- Simulation running (type 'env' to reconfigure) ----------")
             while True:
                 ferda.predict(dt=10.0, wind_speed=wind_v,
                               wind_dir=wind_d, slope=slope)
@@ -902,7 +1069,7 @@ def main():
                     )
                     ferda.update(obs)
                     ferda.render()
-                    print(f"  ✓ Observation from Drone {obs.drone_id} fused "
+                    print(f"  OK Observation from Drone {obs.drone_id} fused "
                           f"(conf={obs.confidence:.1f})")
                 except (ValueError, IndexError):
                     print("  [!] Numeric input required.")
