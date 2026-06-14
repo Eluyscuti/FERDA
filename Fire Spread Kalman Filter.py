@@ -61,14 +61,26 @@ DEFAULT_NLCD = 82  # Cultivated Crops — most common in Indiana
 # OpenStreetMap landuse/natural tags -> NLCD equivalent codes
 # Used by the Overpass API fallback.
 OSM_TO_NLCD = {
+    # agriculture
     "farmland": 82, "farmyard": 82, "orchard": 82, "vineyard": 82,
-    "meadow":   81, "grass": 71, "recreation_ground": 71,
-    "village_green": 71, "cemetery": 71,
-    "forest":   41, "logging": 41,
+    "allotments": 82, "plant_nursery": 82,
+    # hay / pasture / grass
+    "meadow": 81, "grass": 71, "recreation_ground": 71,
+    "village_green": 71, "cemetery": 71, "flowerbed": 71,
+    # forest
+    "forest": 41, "logging": 41, "wood": 41,
+    # shrub
+    "scrub": 52, "heath": 52, "grassland": 71,
+    # developed — universities/parks treated as open space or maintained grass
+    "university": 21, "college": 21, "school": 21, "hospital": 21,
+    "park": 71, "pitch": 71, "golf_course": 71, "nature_reserve": 71,
+    # developed — higher density
     "residential": 22, "commercial": 23, "industrial": 23, "retail": 22,
+    "office": 23, "civic": 22, "government": 22,
     "construction": 31, "brownfield": 31, "quarry": 31, "landfill": 31,
-    "wood":     41, "scrub": 52, "heath": 52, "grassland": 71,
-    "wetland":  90, "marsh": 95, "water": 11,
+    # water / wetland
+    "wetland": 90, "marsh": 95, "water": 11, "reservoir": 11, "basin": 11,
+    # barren
     "bare_rock": 31, "sand": 31, "beach": 31,
 }
 
@@ -163,7 +175,9 @@ class TerrainProfile:
     soil_moisture:     float = 0.35   # 0 = bone dry, 1 = saturated
     hydric_rating:     str   = "N"    # Y = hydric (wetland), N = not hydric
     has_water_nearby:  bool  = False
+    slope_deg:         float = 0.0    # terrain slope in degrees (from 3DEP)
     risk_level:        str   = "medium"
+    weather:           "WeatherData" = field(default_factory=lambda: WeatherData())
     lat:               float = 40.4259
     lon:               float = -86.9081
 
@@ -189,6 +203,52 @@ class DroneObservation:
 
 
 @dataclass
+class WeatherData:
+    """Live weather fetched from Open-Meteo (free, no API key)."""
+    wind_speed:    float = 0.0    # m/s at 10 m
+    wind_dir_met:  float = 0.0    # meteorological: direction wind comes FROM (0=N CW)
+    wind_dir_math: float = 270.0  # math convention: direction fire propagates (0=E CCW)
+    humidity:      float = 50.0   # relative humidity %
+    temperature:   float = 20.0   # Celsius
+    precipitation: float = 0.0    # mm/h current
+    weather_code:  int   = 0      # WMO code
+    description:   str   = "Clear"
+
+    @property
+    def humidity_factor(self) -> float:
+        """Rothermel ROS correction for atmospheric dryness (Rothermel 1972 Table 5 proxy).
+        Dry air (<25% RH) increases effective spread rate by up to 45%.
+        Saturated air (>85% RH) cuts spread by 65% via surface fuel moisture.
+        """
+        rh = self.humidity
+        if rh >= 85: return 0.35
+        if rh >= 65: return 0.60
+        if rh >= 45: return 0.85
+        if rh >= 25: return 1.00  # baseline
+        if rh >= 15: return 1.25
+        return 1.45
+
+    @property
+    def precipitation_factor(self) -> float:
+        """Active rain/snow suppresses fire spread through fuel wetting."""
+        p = self.precipitation
+        if p >= 4.0: return 0.05
+        if p >= 1.0: return 0.20
+        if p >= 0.2: return 0.45
+        return 1.00
+
+
+WMO_DESCRIPTIONS = {
+    0:"Clear", 1:"Mainly clear", 2:"Partly cloudy", 3:"Overcast",
+    45:"Fog", 48:"Icy fog", 51:"Light drizzle", 53:"Moderate drizzle",
+    55:"Dense drizzle", 61:"Light rain", 63:"Moderate rain", 65:"Heavy rain",
+    71:"Light snow", 73:"Moderate snow", 75:"Heavy snow",
+    80:"Light showers", 81:"Moderate showers", 82:"Heavy showers",
+    95:"Thunderstorm", 96:"Thunderstorm+hail", 99:"Severe thunderstorm",
+}
+
+
+@dataclass
 class AlertEvent:
     time:    float
     level:   str    # "INFO" | "WARNING" | "CRITICAL"
@@ -200,382 +260,299 @@ class AlertEvent:
 # -----------------------------------------------------------------------------
 class IndianaMapClient:
     """
-    Fetches terrain/agriculture data from publicly accessible federal APIs:
+    Fetches terrain / agriculture data from public APIs — no API keys required.
 
-      1. USDA CropScape (NASS)  — crop/land-cover type at a lat/lon point
-         https://www.mrlc.gov/geoserver/NLCD_Land_Cover/wms
-         CDL codes differ from NLCD; see CDL_FUEL_MODELS below.
+    WORKING (confirmed):
+      * USDA SDM   — soils       SDMDataAccess.nrcs.usda.gov
+      * USGS NHD   — water       hydro.nationalmap.gov
+      * OSM Overpass — land cover  overpass-api.de / kumi.systems mirrors
 
-      2. USDA SSURGO via SDM Tabular Service (NRCS)  — soil drainage class
-         https://SDMDataAccess.nrcs.usda.gov/tabular/post.rest
-         Spatial query: map-unit polygon that contains the point.
-
-      3. USGS StreamStats / NHD  — water body proximity
-         https://streamstats.usgs.gov/regressionservices/
-
-      4. USGS EPQS (updated URL)  — elevation
-         https://epqs.nationalmap.gov/v1/json
-
-    All endpoints are free, public-domain, no API key required.
-    maps.indiana.edu has been removed — that server is offline.
+    REPLACED (were blocked/timing out):
+      Removed: USGS MRLC, ESRI Living Atlas, USGS EPQS, USGS 3DEP (all blocked/offline)
     """
 
-    # Source A: USGS/MRLC NLCD 2021 WMS GetFeatureInfo
-    # Source: https://www.mrlc.gov/data-services-page
-    MRLC_WMS_URL  = "https://www.mrlc.gov/geoserver/NLCD_Land_Cover/wms"
-    MRLC_LAYER    = "NLCD_2021_Land_Cover_L48"
+    # Land cover: OpenStreetMap Overpass (confirmed working)
+    OVERPASS_URL   = "https://overpass-api.de/api/interpreter"
+    OVERPASS_MIRROR= "https://overpass.kumi.systems/api/interpreter"
 
-    # Source B: ESRI Living Atlas NLCD 2021 ImageServer — different CDN/host
-    # Public ArcGIS Image Service, no API key needed.
-    # If MRLC GeoServer is blocked, this hits Esri's CDN instead.
-    ESRI_NLCD_URL = "https://landscape1.arcgis.com/arcgis/rest/services/USA_NLCD_2021/ImageServer/identify"
-    OVERPASS_URL  = "https://overpass-api.de/api/interpreter"
+    # Land cover backup: OSM Nominatim reverse geocoding (same OSM data, different server)
+    NOMINATIM_URL  = "https://nominatim.openstreetmap.org/reverse"
 
-    # USDA SSURGO / Soil Data Mart tabular REST  (accepts SQL, returns JSON)
-    SDM_URL       = "https://SDMDataAccess.nrcs.usda.gov/tabular/post.rest"
+    # Soils: USDA SDM Tabular REST (confirmed working)
+    SDM_URL        = "https://SDMDataAccess.nrcs.usda.gov/tabular/post.rest"
 
-    # USGS Elevation Point Query Service (updated URL, replaces nationalmap.gov/epqs)
-    USGS_ELEV     = "https://epqs.nationalmap.gov/v1/json"
+    # Water bodies: USGS NHD (confirmed working)
+    NHD_URL        = "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer"
 
-    # USGS NHD REST  (National Hydrography Dataset — water bodies)
-    NHD_URL       = "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer"
+    # Slope A: OpenTopoData — NED 10m for CONUS, no API key, different from USGS directly
+    OPENTOPO_URL   = "https://api.opentopodata.org/v1/ned10m"
 
-    TIMEOUT = 6    # seconds — fail fast; all three sources have reliable fallbacks
+    # Slope B: open-elevation.com — SRTM 30m global, no API key
+    OPENELEV_URL   = "https://api.open-elevation.com/api/v1/lookup"
+    OPENMETEO_URL  = "https://api.open-meteo.com/v1/forecast"
+
+    TIMEOUT = 8
+    HEADERS = {"User-Agent": "FERDA-FireDetection/2.0 (drone fire spread tracker)"}
 
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
         self._cache: dict = {}
-        self._cdl_failed  = False   # set True when MRLC WMS is unreachable
-        self._soil_failed  = False   # set True when SDM is unreachable
+        self._cdl_failed = False
 
     def _log(self, msg: str):
         if self.verbose:
             print(f"  |  {msg}")
 
-    # -- 1. Land Cover — waterfall across two independent endpoints -----------
+    # ── 1. Land Cover ─────────────────────────────────────────────────────────
     def query_land_cover(self, lat: float, lon: float) -> int:
         """
-        Tries two completely independent NLCD sources in sequence:
+        Source A: OSM Overpass is_in() query — confirmed working.
+          Fetches all OSM area polygons containing the point, checks
+          landuse / natural / leisure / amenity tags.
 
-          Source A: USGS/MRLC GeoServer WMS GetFeatureInfo
-                    mrlc.gov/geoserver — USGS operated
-          Source B: ESRI Living Atlas NLCD 2021 ImageServer
-                    landscape1.arcgis.com — Esri CDN, different network path
+        Source B: OSM Nominatim reverse geocoding — same OSM data,
+          completely different server (nominatim.openstreetmap.org).
+          Returns the OSM object at the coordinate; we parse its tags.
 
-        Both return NLCD 2021 land cover codes. Using two sources means a
-        single network block or outage won't reach the manual picker.
+        Both sources use the same OSM_TO_NLCD lookup table.
         """
         cache_key = f"nlcd_{lat:.4f}_{lon:.4f}"
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        # ── Source A: MRLC WMS ────────────────────────────────────────────
-        self._log("Querying land cover [1/3] USGS MRLC WMS...")
-        delta = 0.005
-        bbox  = f"{lon-delta},{lat-delta},{lon+delta},{lat+delta}"
-        try:
-            r = requests.get(
-                self.MRLC_WMS_URL,
-                params={
-                    "SERVICE":      "WMS",
-                    "VERSION":      "1.1.1",
-                    "REQUEST":      "GetFeatureInfo",
-                    "LAYERS":       self.MRLC_LAYER,
-                    "QUERY_LAYERS": self.MRLC_LAYER,
-                    "STYLES":       "",
-                    "BBOX":         bbox,
-                    "WIDTH":        "11",
-                    "HEIGHT":       "11",
-                    "SRS":          "EPSG:4326",
-                    "X":            "5",
-                    "Y":            "5",
-                    "INFO_FORMAT":  "application/json",
-                    "FEATURE_COUNT":"1",
-                },
-                timeout=self.TIMEOUT,
-            )
-            features = r.json().get("features", [])
-            if features:
-                props = features[0].get("properties", {})
-                for k in ("GRAY_INDEX", "value", "pixel"):
-                    if k in props:
-                        code = int(props[k])
-                        if code in NLCD_FUEL_MODELS:
-                            self._log(f"NLCD {code}: {NLCD_FUEL_MODELS[code]['name']} (MRLC)")
-                            self._cache[cache_key] = code
-                            return code
-        except Exception as e:
-            self._log(f"MRLC WMS failed ({type(e).__name__}) — trying fallback...")
-
-        # ── Source B: ESRI Living Atlas ImageServer identify ─────────────
-        self._log("Querying land cover [2/3] ESRI Living Atlas NLCD...")
-        try:
-            r = requests.get(
-                self.ESRI_NLCD_URL,
-                params={
-                    "geometry":      f"{lon},{lat}",
-                    "geometryType":  "esriGeometryPoint",
-                    "sr":            "4326",
-                    "returnGeometry":"false",
-                    "f":             "json",
-                },
-                timeout=self.TIMEOUT,
-            )
-            data  = r.json()
-            # ImageServer identify returns {"value": "82", "name": "Cultivated Crops"}
-            value = data.get("value") or data.get("catalogItems", {})
-            if value and str(value).strip() not in ("", "NoData", "Null"):
-                code = int(float(str(value).strip()))
-                if code in NLCD_FUEL_MODELS:
-                    self._log(f"NLCD {code}: {NLCD_FUEL_MODELS[code]['name']} (ESRI Atlas)")
-                    self._cache[cache_key] = code
-                    return code
-        except Exception as e:
-            self._log(f"ESRI Atlas failed ({type(e).__name__})")
-
-        # -- Source C: OpenStreetMap Overpass API --------------------------
-        # Tries two Overpass mirrors in sequence with a User-Agent header.
-        # Overpass silently rate-limits anonymous requests; a descriptive
-        # User-Agent is polite and avoids most blocks.
-        OVERPASS_MIRRORS = [
-            self.OVERPASS_URL,                          # overpass-api.de (main)
-            "https://overpass.kumi.systems/api/interpreter",  # kumi.systems mirror
-        ]
-        HEADERS = {"User-Agent": "FERDA-FireDetection/2.0 (drone fire spread tracker)"}
+        # -- Source A: Overpass is_in -----------------------------------------
         query = (
             f"[out:json][timeout:8];"
             f"is_in({lat},{lon})->.a;"
-            f"(area.a[landuse];area.a[natural];);"
+            f"(area.a[landuse];area.a[natural];area.a[leisure];area.a[amenity];);"
             f"out tags;"
         )
-        for mirror_url in OVERPASS_MIRRORS:
-            self._log(f"Querying land cover [3/3] OpenStreetMap Overpass ({mirror_url.split('/')[2]})...")
+        for mirror in (self.OVERPASS_URL, self.OVERPASS_MIRROR):
+            self._log(f"Querying land cover [A] Overpass ({mirror.split('/')[2]})...")
             try:
-                r = requests.post(
-                    mirror_url,
-                    data={"data": query},
-                    headers=HEADERS,
-                    timeout=self.TIMEOUT,
-                )
-                # Guard: some error responses return HTML instead of JSON
-                ct = r.headers.get("Content-Type", "")
-                if r.status_code != 200 or "html" in ct.lower():
-                    self._log(f"Overpass non-JSON response (HTTP {r.status_code}) — trying next mirror")
-                    continue
-                elements = r.json().get("elements", [])
-                for el in reversed(elements):  # reversed = smallest/most specific area first
-                    tags = el.get("tags", {})
-                    for osm_key in ("landuse", "natural"):
-                        val = tags.get(osm_key, "").lower()
-                        if val in OSM_TO_NLCD:
-                            code = OSM_TO_NLCD[val]
-                            self._log(f"OSM {osm_key}={val} -> NLCD {code}: "
-                                      f"{NLCD_FUEL_MODELS[code]['name']} (Overpass)")
-                            self._cache[cache_key] = code
-                            return code
-                self._log("Overpass: no landuse/natural tag found at this point")
-                break   # got a valid response, just no matching tag — no point trying mirror
+                r = requests.post(mirror, data={"data": query},
+                                  headers=self.HEADERS, timeout=self.TIMEOUT)
+                if r.status_code == 200 and "html" not in r.headers.get("Content-Type","").lower():
+                    for el in reversed(r.json().get("elements", [])):
+                        tags = el.get("tags", {})
+                        for key in ("landuse","natural","leisure","amenity"):
+                            val = tags.get(key,"").lower()
+                            if val in OSM_TO_NLCD:
+                                code = OSM_TO_NLCD[val]
+                                self._log(f"OSM {key}={val} -> NLCD {code}: {NLCD_FUEL_MODELS[code]['name']}")
+                                self._cache[cache_key] = code
+                                return code
+                    self._log("Overpass: no matching tag — trying Nominatim")
+                    break
+                self._log(f"Overpass HTTP {r.status_code} — trying mirror")
             except Exception as e:
-                self._log(f"Overpass mirror failed ({type(e).__name__}) — trying next")
+                self._log(f"Overpass failed ({type(e).__name__}) — trying mirror")
 
-        # -- All three failed -> manual picker -----------------------------
+        # -- Source B: Nominatim reverse geocoding ----------------------------
+        self._log("Querying land cover [B] OSM Nominatim reverse geocoding...")
+        try:
+            r = requests.get(
+                self.NOMINATIM_URL,
+                params={"lat": lat, "lon": lon, "format": "jsonv2",
+                        "addressdetails": "0", "extratags": "1"},
+                headers=self.HEADERS,
+                timeout=self.TIMEOUT,
+            )
+            data = r.json()
+            # Nominatim returns extratags with landuse, natural etc.
+            extra = data.get("extratags") or {}
+            tags  = {**extra, "class": data.get("class",""), "type": data.get("type","")}
+            for key in ("landuse","natural","leisure","amenity","class","type"):
+                val = str(tags.get(key,"")).lower()
+                if val in OSM_TO_NLCD:
+                    code = OSM_TO_NLCD[val]
+                    self._log(f"Nominatim {key}={val} -> NLCD {code}: {NLCD_FUEL_MODELS[code]['name']}")
+                    self._cache[cache_key] = code
+                    return code
+        except Exception as e:
+            self._log(f"Nominatim failed ({type(e).__name__})")
+
         self._cdl_failed = True
-        self._log("All 3 land cover sources unreachable -- will prompt manually")
+        self._log("Both land cover sources failed — will prompt manually")
         return DEFAULT_NLCD
 
-    # -- 2. Soil data via USDA SDM Tabular REST --------------------------------
+    # ── 2. Soils (confirmed working — single source, no backup needed) ────────
     def query_soils(self, lat: float, lon: float) -> dict:
-        """
-        Query USDA Soil Data Mart (SDM) for the dominant soil component at point.
-        Uses a spatial SQL query against the SSURGO mapunit table.
-        Returns drainage class, hydric flag, and a moisture proxy.
-        """
-        self._log("Querying soils (USDA SSURGO / SDM Tabular)...")
-        defaults = {
-            "name": "Silty Clay Loam (Indiana default)",
-            "drainage": "Well drained",
-            "hydric": "N",
-            "moisture": 0.35,
-        }
-
-        # SDM tabular SQL: find dominant component for the map unit containing point
+        """USDA SSURGO via SDM Tabular REST — spatial SQL for dominant component."""
+        self._log("Querying soils (USDA SSURGO / SDM)...")
+        defaults = {"name": "Silty Clay Loam (Indiana default)",
+                    "drainage": "Well drained", "hydric": "N", "moisture": 0.35}
         sql = (
             f"SELECT TOP 1 co.compname, co.drainagecl, co.hydricrating "
-            f"FROM mapunit mu "
-            f"INNER JOIN component co ON mu.mukey = co.mukey "
-            f"INNER JOIN mupolygon mp ON mu.mukey = mp.mukey "
-            f"WHERE co.majcompflag = 'Yes' "
+            f"FROM mapunit mu INNER JOIN component co ON mu.mukey=co.mukey "
+            f"INNER JOIN mupolygon mp ON mu.mukey=mp.mukey "
+            f"WHERE co.majcompflag='Yes' "
             f"AND mp.mupolygongeo.STContains("
-            f"geometry::STGeomFromText('POINT({lon} {lat})', 4326)) = 1 "
+            f"geometry::STGeomFromText('POINT({lon} {lat})',4326))=1 "
             f"ORDER BY co.comppct_r DESC"
         )
         try:
-            r = requests.post(
-                self.SDM_URL,
-                data={"format": "JSON+COLUMNNAME", "query": sql},
-                timeout=self.TIMEOUT,
-            )
+            r = requests.post(self.SDM_URL,
+                              data={"format":"JSON+COLUMNNAME","query":sql},
+                              timeout=self.TIMEOUT)
             rows = r.json().get("Table", [])
-            if len(rows) >= 2:   # row 0 = column names, row 1 = first data row
-                cols = rows[0]
-                vals = rows[1]
-                row  = dict(zip(cols, vals))
-                name   = str(row.get("compname",    defaults["name"]))
-                drain  = str(row.get("drainagecl",  defaults["drainage"]))
-                hydric = str(row.get("hydricrating", "No"))
-                hydric_flag = "Y" if hydric.lower() in ("yes", "y") else "N"
-
-                drain_moisture = {
-                    "Excessively drained":          0.05,
-                    "Somewhat excessively drained": 0.12,
-                    "Well drained":                 0.25,
-                    "Moderately well drained":      0.40,
-                    "Somewhat poorly drained":      0.55,
-                    "Poorly drained":               0.70,
-                    "Very poorly drained":          0.85,
-                }
-                moisture = drain_moisture.get(drain, 0.35)
-                self._log(f"Soil: {name} | {drain} | Hydric: {hydric_flag} | Moisture: {moisture:.0%}")
-                return {"name": name, "drainage": drain, "hydric": hydric_flag, "moisture": moisture}
+            if len(rows) >= 2:
+                row = dict(zip(rows[0], rows[1]))
+                name   = str(row.get("compname", defaults["name"]))
+                drain  = str(row.get("drainagecl", defaults["drainage"]))
+                hydric = "Y" if str(row.get("hydricrating","No")).lower() in ("yes","y") else "N"
+                moisture = {"Excessively drained":0.05,"Somewhat excessively drained":0.12,
+                            "Well drained":0.25,"Moderately well drained":0.40,
+                            "Somewhat poorly drained":0.55,"Poorly drained":0.70,
+                            "Very poorly drained":0.85}.get(drain, 0.35)
+                self._log(f"Soil: {name} | {drain} | Hydric: {hydric} | Moisture: {moisture:.0%}")
+                return {"name":name,"drainage":drain,"hydric":hydric,"moisture":moisture}
         except Exception as e:
-            self._log(f"SDM unreachable: {type(e).__name__}")
-            self._soil_failed = True
-
-        self._log("Using Indiana default soil profile")
+            self._log(f"SDM failed ({type(e).__name__})")
         return defaults
 
-    # -- 3. Water body proximity via USGS NHD ----------------------------------
+    # ── 3. Water bodies (confirmed working — single source, no backup needed) ──
     def query_water_nearby(self, lat: float, lon: float, buffer_deg: float = 0.005) -> bool:
-        """
-        Query USGS National Hydrography Dataset REST service for water bodies
-        within ~500 m of the point (0.005° ≈ 500 m at Indiana latitudes).
-        """
+        """USGS NHD REST — water body count within ~500m."""
         self._log("Checking water bodies (USGS NHD)...")
-        xmin = lon - buffer_deg; xmax = lon + buffer_deg
-        ymin = lat - buffer_deg; ymax = lat + buffer_deg
+        xmin,xmax = lon-buffer_deg, lon+buffer_deg
+        ymin,ymax = lat-buffer_deg, lat+buffer_deg
         try:
-            r = requests.get(
-                f"{self.NHD_URL}/0/query",    # layer 0 = NHDArea (water bodies)
-                params={
-                    "geometry":     f"{xmin},{ymin},{xmax},{ymax}",
-                    "geometryType": "esriGeometryEnvelope",
-                    "inSR":         "4326",
-                    "spatialRel":   "esriSpatialRelIntersects",
-                    "returnCountOnly": "true",
-                    "f":            "json",
-                },
-                timeout=self.TIMEOUT,
-            )
+            r = requests.get(f"{self.NHD_URL}/0/query",
+                params={"geometry":f"{xmin},{ymin},{xmax},{ymax}",
+                        "geometryType":"esriGeometryEnvelope","inSR":"4326",
+                        "spatialRel":"esriSpatialRelIntersects",
+                        "returnCountOnly":"true","f":"json"},
+                timeout=self.TIMEOUT)
             count = r.json().get("count", 0)
             found = count > 0
-            self._log(f"Water bodies found: {'YES ({count} features — spread reduced)' if found else 'No'}")
+            self._log(f"Water bodies: {'YES' if found else 'No'}")
             return found
         except Exception as e:
-            self._log(f"NHD water query failed: {e}")
+            self._log(f"NHD failed ({type(e).__name__})")
             return False
 
-    # -- 4. Elevation via USGS EPQS --------------------------------------------
-    def query_elevation(self, lat: float, lon: float) -> Optional[float]:
-        """USGS Elevation Point Query Service — returns elevation in metres."""
-        self._log("Querying elevation (USGS EPQS)...")
+    # ── 4. Slope — two independent sources, neither USGS ─────────────────────
+    def query_slope(self, lat: float, lon: float) -> float:
+        """
+        Source A: OpenTopoData NED10m — wraps the same USGS NED 10m DEM but
+          served from a non-USGS server (api.opentopodata.org). Accepts up to
+          100 locations per request; we send 3 to compute finite-difference slope.
+
+        Source B: open-elevation.com — SRTM 30m global coverage. Different
+          network path, different data source (NASA SRTM vs USGS NED).
+
+        Both use the same three-point finite difference:
+          slope = arctan(max(|elev_N - elev_C|, |elev_E - elev_C|) / 100m)
+        """
+        dlat = 0.0009                                    # ~100 m in latitude
+        dlon = 0.0009 / math.cos(math.radians(lat))     # ~100 m in longitude
+
+        def rise_to_slope(c, n, e):
+            return math.degrees(math.atan(max(abs(n-c), abs(e-c)) / 100.0))
+
+        # -- Source A: OpenTopoData NED10m ------------------------------------
+        self._log("Querying slope [A] OpenTopoData NED10m...")
         try:
-            r = requests.get(
-                self.USGS_ELEV,
-                params={"x": lon, "y": lat, "units": "Meters",
-                        "wkid": "4326", "includeDate": "false"},
-                timeout=self.TIMEOUT,
-            )
-            elev = float(r.json()["value"])
-            self._log(f"Elevation: {elev:.1f} m ASL")
-            return elev
+            locs = (f"{lat},{lon}|{lat+dlat},{lon}|{lat},{lon+dlon}")
+            r = requests.get(self.OPENTOPO_URL,
+                             params={"locations": locs},
+                             headers=self.HEADERS, timeout=self.TIMEOUT)
+            results = r.json().get("results", [])
+            if len(results) == 3:
+                elev = [res["elevation"] for res in results]
+                if None not in elev:
+                    slope = rise_to_slope(*elev)
+                    self._log(f"Slope: {slope:.2f} deg (OpenTopoData NED10m)")
+                    return slope
         except Exception as e:
-            self._log(f"Elevation query failed: {e}")
-            return None
+            self._log(f"OpenTopoData failed ({type(e).__name__})")
 
-    # -- Assemble TerrainProfile -----------------------------------------------
-    # ── Interactive terrain picker (used when APIs are unreachable) ──────────
-    @staticmethod
-    def _pick_land_cover() -> int:
-        """Show a numbered menu of common terrain types and return NLCD code."""
-        MENU = [
-            (82,  "Cultivated Crops       (mult x1.10 — medium)"),
-            (81,  "Hay / Pasture          (mult x1.30 — medium-high)"),
-            (71,  "Grassland / Herbaceous (mult x1.40 — high)"),
-            (52,  "Shrub / Scrub          (mult x1.60 — high)"),
-            (41,  "Deciduous Forest       (mult x1.20 — medium)"),
-            (42,  "Evergreen Forest       (mult x1.80 — CRITICAL)"),
-            (43,  "Mixed Forest           (mult x1.50 — high)"),
-            (31,  "Barren / Fallow        (mult x0.10 — low)"),
-            (11,  "Open Water / Wetland   (mult x0.00 — no spread)"),
-            (21,  "Developed / Open Space (mult x0.30 — low)"),
-        ]
-        print("\n  +-- Land Cover / Fuel Model (API unavailable) --------------------")
-        for i, (code, label) in enumerate(MENU, 1):
-            print(f"  |  {i:2d}. {label}")
-        print("  +------------------------------------------------------------------")
-        while True:
-            raw = input("  Select [1]: ").strip()
-            if not raw:
-                return MENU[0][0]  # Cultivated Crops default
-            try:
-                idx = int(raw) - 1
-                if 0 <= idx < len(MENU):
-                    return MENU[idx][0]
-            except ValueError:
-                pass
-            print("  [!] Enter a number 1–10")
+        # -- Source B: open-elevation.com SRTM --------------------------------
+        self._log("Querying slope [B] open-elevation.com SRTM...")
+        try:
+            r = requests.post(self.OPENELEV_URL,
+                json={"locations":[
+                    {"latitude":lat,       "longitude":lon      },
+                    {"latitude":lat+dlat,  "longitude":lon      },
+                    {"latitude":lat,       "longitude":lon+dlon },
+                ]},
+                headers=self.HEADERS, timeout=self.TIMEOUT)
+            results = r.json().get("results", [])
+            if len(results) == 3:
+                elev = [res["elevation"] for res in results]
+                if None not in elev:
+                    slope = rise_to_slope(*elev)
+                    self._log(f"Slope: {slope:.2f} deg (open-elevation SRTM)")
+                    return slope
+        except Exception as e:
+            self._log(f"open-elevation failed ({type(e).__name__})")
 
-    @staticmethod
-    def _pick_soil() -> dict:
-        """Show a drainage-class menu and return a soil dict."""
-        MENU = [
-            ("Well drained",           0.25, "N", "Sandy Loam / Silt Loam"),
-            ("Moderately well drained", 0.40, "N", "Silt Loam / Loam"),
-            ("Somewhat poorly drained", 0.55, "N", "Silty Clay Loam"),
-            ("Poorly drained",          0.70, "Y", "Silty Clay / Muck (hydric)"),
-            ("Excessively drained",     0.05, "N", "Loamy Sand / Gravelly"),
-        ]
-        print("\n  +-- Soil Drainage Class (API unavailable) ------------------------")
-        for i, (drain, moist, hydric, name) in enumerate(MENU, 1):
-            hydric_note = "  [hydric]" if hydric == "Y" else ""
-            print(f"  |  {i}. {drain:<32} moisture ~{moist:.0%}{hydric_note}")
-        print("  +------------------------------------------------------------------")
-        while True:
-            raw = input("  Select [1]: ").strip()
-            if not raw:
-                choice = MENU[0]
-                break
-            try:
-                idx = int(raw) - 1
-                if 0 <= idx < len(MENU):
-                    choice = MENU[idx]
-                    break
-            except ValueError:
-                pass
-            print("  [!] Enter a number 1–5")
-        drain, moist, hydric, name = choice
-        return {"name": name, "drainage": drain, "hydric": hydric, "moisture": moist}
+        self._log("Slope: both sources failed -- defaulting 0.0 deg (override in env prompt)")
+        return 0.0
+
+    def query_weather(self, lat: float, lon: float) -> "WeatherData":
+        """
+        Open-Meteo live weather — free, no API key, global coverage.
+        Returns current wind speed/direction, relative humidity, temperature,
+        precipitation, and WMO weather code.
+
+        Wind direction conversion:
+          Meteorological: direction wind comes FROM (0=north, 90=east, clockwise)
+          Math/fire:      direction fire propagates (0=east, CCW)
+          Formula: math_dir = (270 - met_dir) % 360
+        """
+        self._log("Querying live weather (Open-Meteo)...")
+        try:
+            r = requests.get(self.OPENMETEO_URL, params={
+                "latitude": lat, "longitude": lon, "timezone": "auto",
+                "wind_speed_unit": "ms",
+                "current": ("wind_speed_10m,wind_direction_10m,"
+                            "relative_humidity_2m,temperature_2m,"
+                            "precipitation,weather_code"),
+            }, timeout=self.TIMEOUT)
+            cur  = r.json().get("current", {})
+            ws   = float(cur.get("wind_speed_10m",        0.0))
+            wdm  = float(cur.get("wind_direction_10m",    0.0))
+            rh   = float(cur.get("relative_humidity_2m",  50.0))
+            temp = float(cur.get("temperature_2m",         20.0))
+            prec = float(cur.get("precipitation",           0.0))
+            wco  = int(cur.get("weather_code",               0))
+            desc = WMO_DESCRIPTIONS.get(wco, f"WMO {wco}")
+            math_dir = (270.0 - wdm) % 360.0
+            self._log(
+                f"Wind: {ws:.1f} m/s from {wdm:.0f}deg "
+                f"-> propagates {math_dir:.0f}deg | "
+                f"RH:{rh:.0f}% | {temp:.1f}C | Precip:{prec:.1f}mm/h | {desc}"
+            )
+            return WeatherData(
+                wind_speed=ws, wind_dir_met=wdm, wind_dir_math=math_dir,
+                humidity=rh, temperature=temp, precipitation=prec,
+                weather_code=wco, description=desc,
+            )
+        except Exception as e:
+            self._log(f"Open-Meteo failed ({type(e).__name__}) -- enter wind manually")
+            return WeatherData()
 
     def build_terrain_profile(self, lat: float, lon: float) -> TerrainProfile:
         """
-        Queries USGS MRLC NLCD WMS, USDA SDM, and USGS NHD.
+        Queries OSM Overpass/Nominatim (land cover), USDA SDM (soils), USGS NHD (water), OpenTopoData/open-elevation (slope), Open-Meteo (weather).
         If any service is unreachable, drops into an interactive picker
         so the operator always gets a meaningful terrain profile.
         """
         print(f"\n  +--- Terrain Fetch (USDA/USGS APIs) --- ({lat:.4f}N, {abs(lon):.4f}W) --")
 
-        nlcd = self.query_land_cover(lat, lon)
-        soil = self.query_soils(lat, lon)
-        water = self.query_water_nearby(lat, lon)
+        nlcd    = self.query_land_cover(lat, lon)
+        soil    = self.query_soils(lat, lon)
+        water   = self.query_water_nearby(lat, lon)
+        slope   = self.query_slope(lat, lon)
+        weather = self.query_weather(lat, lon)
 
         # ── Manual override when APIs were unreachable ─────────────────────
         if self._cdl_failed:
             print("  [!] Land cover API offline — please select terrain manually:")
             nlcd = self._pick_land_cover()
 
-        if self._soil_failed:
-            print("  [!] Soil API offline — please select drainage class manually:")
-            soil = self._pick_soil()
 
         fuel_data = NLCD_FUEL_MODELS.get(nlcd, NLCD_FUEL_MODELS[DEFAULT_NLCD])
 
@@ -588,7 +565,9 @@ class IndianaMapClient:
             soil_moisture   = soil["moisture"],
             hydric_rating   = soil["hydric"],
             has_water_nearby= water,
+            slope_deg       = slope,
             risk_level      = fuel_data["risk"],
+            weather         = weather,
             lat=lat, lon=lon,
         )
         print(f"  |")
@@ -597,6 +576,8 @@ class IndianaMapClient:
         print(f"  |  * Soil         : {profile.soil_name[:40]}")
         print(f"  |  * Drainage     : {profile.drainage_class}  (moisture {profile.soil_moisture:.0%})")
         print(f"  |  * Hydric Soil  : {profile.hydric_rating}  (wetland penalty if Y)")
+        print(f"  |  * Slope        : {slope:.1f} degrees")
+        print(f"  |  * Weather      : {weather.description} | Wind {weather.wind_speed:.1f} m/s | RH {weather.humidity:.0f}% | Precip {weather.precipitation:.1f}mm/h")
         print(f"  |  * Water Nearby : {'YES -- spread penalty applied' if water else 'No'}")
         print(f"  |  * Risk Level   : {profile.risk_level.upper()}")
         print(f"  +-------------------------------------------------------------------\n")
@@ -748,7 +729,11 @@ class FireSpreadModel:
         # Effective terrain multiplier (includes soil moisture, hydric, water)
         eff = self.terrain.effective_mult()
 
-        ros = self.BASE_ROS * (1 + phi_w + phi_s) * eff   # m/s
+        # Weather correction factors from Open-Meteo data
+        wx = getattr(self.terrain, "weather", None)
+        wx_factor = (wx.humidity_factor * wx.precipitation_factor
+                     if wx is not None else 1.0)
+        ros = self.BASE_ROS * (1 + phi_w + phi_s) * eff * wx_factor  # m/s
 
         # Andrews (1986) length-to-breadth ratio from 10-m wind speed
         U = wind_speed
@@ -1019,6 +1004,9 @@ class FERDA_System:
         conf    = kf.confidence_pct
         c_color = "#00FF7F" if conf > 70 else "#FFA500" if conf > 40 else "#FF4444"
         nis_str = f"{kf.last_nis:.1f}" if kf.last_nis is not None else "n/a"
+        wx = getattr(self.terrain, "weather", None)
+        wx_line = (f"{wx.description} | RH:{wx.humidity:.0f}% | T:{wx.temperature:.1f}C"
+                   if wx and wx.wind_speed > 0 else "Weather: not fetched")
         self.txt_status.set_text(
             f"[t]  {self.current_time:.0f} s\n"
             f"Conf  {conf:.1f}%   Risk: {risk_lvl.upper()}\n"
@@ -1026,7 +1014,8 @@ class FERDA_System:
             f"CX {kf.cx:.1f} m   CY {kf.cy:.1f} m\n"
             f"a={kf.semi_major:.1f}m  b={kf.semi_minor:.1f}m\n"
             f"Area  {kf.area_m2/10_000:.3f} ha\n"
-            f"Wind  {self.wind_speed:.1f} m/s @ {self.wind_dir:.0f}°"
+            f"Wind  {self.wind_speed:.1f} m/s @ {self.wind_dir:.0f}\u00b0\n"
+            f"{wx_line}"
         )
         self.txt_status.set_color(c_color)
 
@@ -1090,7 +1079,7 @@ def print_banner():
     print("\n" + "═" * 66)
     print("  FERDA v2.0  —  Fire Emergency Response Drone Analysis")
     print("  IndianaMap Agriculture Data Integration")
-    print("  Source: https://www.indianamap.org  (maps.indiana.edu REST API)")
+    print("  APIs: OSM Overpass, USDA SDM, USGS NHD, OpenTopoData, Open-Meteo")
     print("═" * 66)
 
 def print_controls():
@@ -1143,10 +1132,22 @@ def main():
     try:
         while True:
             # -- Environment config --------------------------------------------
-            print("\n  --- Environment ---------------------------------------------")
-            wind_v = get_float("  Wind Speed (m/s): ")
-            wind_d = get_float("  Wind Direction (° from East, CCW): ")
-            slope  = get_float("  Slope Angle (°): ")
+            print("\n  --- Environment (weather auto-fetched from Open-Meteo) ------")
+            _client = IndianaMapClient(verbose=False)
+            wx = _client.query_weather(ferda.terrain.lat, ferda.terrain.lon)
+            ferda.terrain.weather = wx
+            print(f"  Weather  : {wx.description}")
+            print(f"  Wind     : {wx.wind_speed:.1f} m/s from {wx.wind_dir_met:.0f}deg-met"
+                  f" -> {wx.wind_dir_math:.0f}deg-math")
+            print(f"  Humidity : {wx.humidity:.0f}%  |  Temp: {wx.temperature:.1f}C"
+                  f"  |  Precip: {wx.precipitation:.1f}mm/h")
+            ws_raw = input(f"  Wind speed  [Enter=keep {wx.wind_speed:.1f} m/s]: ").strip()
+            wd_raw = input(f"  Wind dir    [Enter=keep {wx.wind_dir_math:.0f} deg-math]: ").strip()
+            wind_v = float(ws_raw) if ws_raw else wx.wind_speed
+            wind_d = float(wd_raw) if wd_raw else wx.wind_dir_math
+            auto_slope = ferda.terrain.slope_deg
+            sl_raw = input(f"  Slope       [Enter=keep {auto_slope:.1f} deg]: ").strip()
+            slope = float(sl_raw) if sl_raw else auto_slope
 
             # -- Simulation loop -----------------------------------------------
             print("\n  --- Simulation running (type 'env' to reconfigure) ----------")
