@@ -584,6 +584,19 @@ class IndianaMapClient:
         return profile
 
 
+
+# Fuel load (kg/m2) by NLCD class — Scott & Burgan (2005) RMRS-GTR-153
+# Used in Byram (1959) fireline intensity: I = H x w x r
+NLCD_FUEL_LOAD = {
+    11: 0.00,  42: 1.20,  71: 0.35,
+    21: 0.10,  43: 1.00,  81: 0.40,
+    22: 0.08,  52: 0.70,  82: 0.30,
+    23: 0.05,  41: 0.80,  90: 0.20,
+    24: 0.02,  31: 0.05,  95: 0.25,
+}
+DEFAULT_FUEL_LOAD = 0.30  # kg/m2 fallback
+
+
 # -----------------------------------------------------------------------------
 # 5-STATE EXTENDED KALMAN FILTER  [cx, cy, a, b, θ]
 #   cx, cy  — fire centroid (m)
@@ -783,6 +796,79 @@ class RiskAssessor:
 
 
 # -----------------------------------------------------------------------------
+# FIRELINE CALCULATOR
+#
+# Byram, G.M. (1959) "Combustion of forest fuels." In: Davis KP (ed)
+#   Forest Fire: Control and Use. McGraw-Hill. pp 61-89.
+#   Fireline intensity: I = H x w x r  (kW/m)
+#   Flame length:       L = 0.0775 x I^0.46  (m)
+#
+# NWCG PMS 410-1 (2004) Fireline Handbook, Appendix A (attack thresholds):
+#   < 500 kW/m  : direct attack, hand tools feasible
+#   < 2000 kW/m : mechanized (dozer/engine) attack feasible
+#   < 4000 kW/m : aerial retardant may be effective
+#   >= 4000 kW/m: indirect attack only — no safe direct approach
+#
+# Lindsey & Bratten (1983) / NWCG PMS 410-1:
+#   Safety zone diameter >= 4 x flame_length
+#
+# Andrews (1986) BEHAVE INT-194:
+#   Optimal fireline: flank of ellipse, anchored at back-of-fire,
+#   offset laterally by semi-minor + 20% safety buffer.
+# -----------------------------------------------------------------------------
+class FirelineCalculator:
+    H_COMBUSTION   = 18_000.0  # kJ/kg heat of combustion (Rothermel 1972 Table 1)
+    THRESH_HAND    =    500.0  # kW/m  NWCG: hand crew direct attack feasible
+    THRESH_DOZER   =  2_000.0  # kW/m  NWCG: dozer/engine feasible
+    THRESH_AERIAL  =  4_000.0  # kW/m  NWCG: aerial retardant may work
+    SAFETY_FACTOR  =      4.0  # safety zone diam = 4 x flame_length (Lindsey & Bratten 1983)
+
+    def __init__(self, terrain: "TerrainProfile"):
+        self.terrain = terrain
+
+    def byram_intensity(self, ros_ms: float) -> float:
+        """Byram (1959): I = H x w x r  [kW/m]"""
+        w = NLCD_FUEL_LOAD.get(self.terrain.nlcd_code, DEFAULT_FUEL_LOAD)
+        return self.H_COMBUSTION * w * ros_ms
+
+    def flame_length(self, intensity_kw: float) -> float:
+        """Byram (1959): L = 0.0775 x I^0.46  [m]"""
+        return 0.0775 * (max(intensity_kw, 0.0) ** 0.46) if intensity_kw > 0 else 0.0
+
+    def attack_method(self, intensity_kw: float):
+        """NWCG PMS 410-1 attack feasibility by fireline intensity."""
+        if intensity_kw < self.THRESH_HAND:
+            return "DIRECT - hand tools", "#00FF7F"
+        if intensity_kw < self.THRESH_DOZER:
+            return "DIRECT - dozer/engine", "#FFD700"
+        if intensity_kw < self.THRESH_AERIAL:
+            return "AERIAL retardant + indirect", "#FFA500"
+        return "INDIRECT ONLY - no safe direct attack", "#FF4444"
+
+    def safety_zone_radius(self, flame_len_m: float) -> float:
+        """Min safety zone radius: diam >= 4 x flame_length (Lindsey & Bratten 1983)."""
+        return self.SAFETY_FACTOR * flame_len_m / 2.0
+
+    def recommended_fireline(self, kf, wind_dir_rad: float) -> dict:
+        """
+        Andrews (1986) BEHAVE optimal fireline placement.
+        Fireline runs along the LEFT FLANK of the fire ellipse, from an
+        anchor at the back-of-fire to the head, offset by semi-minor + 20%.
+        """
+        cx, cy = kf.cx, kf.cy
+        a, b   = kf.semi_major, kf.semi_minor
+        ct, st = math.cos(wind_dir_rad), math.sin(wind_dir_rad)
+        # perpendicular (left flank = 90 deg CCW from wind)
+        px, py = -st, ct
+        offset = b * 1.20  # semi-minor + 20% buffer
+        back = (cx - a*ct + px*offset, cy - a*st + py*offset)
+        tip  = (cx + a*ct + px*offset, cy + a*st + py*offset)
+        return {"anchor": back, "tip": tip,
+                "length": math.hypot(tip[0]-back[0], tip[1]-back[1])}
+
+
+
+# -----------------------------------------------------------------------------
 # FERDA v2.0 — MAIN SYSTEM
 # -----------------------------------------------------------------------------
 class FERDA_System:
@@ -791,10 +877,16 @@ class FERDA_System:
         self.spread       = FireSpreadModel(terrain)
         self.terrain      = terrain
         self.risk         = RiskAssessor()
+        self.fireline     = FirelineCalculator(terrain)
+        self._topo_grid   = None   # (X, Y, Z) numpy arrays fetched once
+        self._topo_contour= None   # matplotlib QuadContourSet handle
+        self._fl_line     = None   # fireline artist
+        self._sz_circle   = None   # safety zone artist
         self.current_time = 0.0
         self.wind_speed   = 0.0
         self.wind_dir     = 0.0
 
+        self.intensity_history: List[float] = [0.0]
         self.history: List[dict] = [{"t": 0, "a": ir, "b": ir * 0.65,
                                       "area": math.pi * ir * ir * 0.65}]
         self.observations: List[DroneObservation] = []
@@ -802,124 +894,411 @@ class FERDA_System:
 
         self._build_figure()
 
+    # -- TOPO GRID -----------------------------------------------------------
+    def _fetch_topo_grid(self, n: int = 16):
+        """
+        Queries open-elevation.com for an n x n elevation grid centred on
+        the fire origin, spanning the map SPAN in local metres.
+        Converts local (x, y) metres to WGS84 offsets, batches into one
+        POST request, and returns (X, Y, Z) numpy arrays for contour plotting.
+        SPAN = 650 m from _build_figure.
+        """
+        SPAN = 650
+        xs = np.linspace(-80, SPAN, n)
+        ys = np.linspace(-80, SPAN, n)
+        lat0, lon0 = self.terrain.lat, self.terrain.lon
+        # 1 degree lat ~= 111,320 m; 1 degree lon ~= 111,320 * cos(lat) m
+        dlat_per_m = 1.0 / 111_320.0
+        dlon_per_m = 1.0 / (111_320.0 * math.cos(math.radians(lat0)))
+
+        locations = []
+        for y in ys:
+            for x in xs:
+                locations.append({
+                    "latitude":  lat0 + y * dlat_per_m,
+                    "longitude": lon0 + x * dlon_per_m,
+                })
+        try:
+            r = requests.post(
+                "https://api.open-elevation.com/api/v1/lookup",
+                json={"locations": locations},
+                headers={"User-Agent": "FERDA-FireDetection/2.0"},
+                timeout=20,
+            )
+            results = r.json().get("results", [])
+            if len(results) == n * n:
+                elevs = np.array([res["elevation"] for res in results],
+                                 dtype=float).reshape(n, n)
+                X, Y = np.meshgrid(xs, ys)
+                print(f"  Topo grid: {n}x{n} pts, "
+                      f"elev range {elevs.min():.0f}-{elevs.max():.0f} m ASL")
+                return X, Y, elevs
+        except Exception as e:
+            print(f"  Topo grid fetch failed ({type(e).__name__}) — skipping contours")
+        return None
+
     # -- FIGURE ---------------------------------------------------------------
+    # ── PROCEDURAL TERRAIN ────────────────────────────────────────────────────
+    def _make_terrain(self, span=650, n=200):
+        xs = np.linspace(-80, span, n)
+        ys = np.linspace(-80, span, n)
+        X, Y = np.meshgrid(xs, ys)
+        topo = self._fetch_topo_grid(n=18)
+        if topo is not None:
+            try:
+                from scipy.interpolate import RegularGridInterpolator
+                Xc, Yc, Zc = topo
+                rgi = RegularGridInterpolator(
+                    (Xc[0, :], Yc[:, 0]), Zc.T,
+                    method='linear', bounds_error=False, fill_value=None)
+                Z = rgi((X, Y))
+            except Exception:
+                topo = None
+        if topo is None:
+            rng = np.random.default_rng(
+                int(abs(self.terrain.lat * 1000) + abs(self.terrain.lon * 1000)))
+            Z = np.zeros((n, n))
+            for amp, freq in [(80, 0.006), (30, 0.015), (12, 0.04), (4, 0.10)]:
+                ph = rng.uniform(0, 2 * np.pi, (2,))
+                Z += amp * (np.sin(freq * X + ph[0]) * np.cos(freq * Y + ph[1]))
+            Z -= Z.min()
+        dz_dx = np.gradient(Z, axis=1)
+        dz_dy = np.gradient(Z, axis=0)
+        sun = np.array([-1.0, -1.0, 2.0])
+        sun /= np.linalg.norm(sun)
+        norm = np.stack([-dz_dx, -dz_dy, np.ones_like(Z)], axis=-1)
+        nlen = np.linalg.norm(norm, axis=-1, keepdims=True)
+        nlen[nlen == 0] = 1.0
+        norm /= nlen
+        shade = np.clip((norm * sun).sum(axis=-1), 0.0, 1.0)
+        return X, Y, Z, shade
+
+    def _fuel_alpha_map(self, X, Y):
+        rng = np.random.default_rng(42)
+        base = self.terrain.effective_mult()
+        noise = np.zeros_like(X)
+        for amp, freq in [(0.3, 0.012), (0.15, 0.030)]:
+            ph = rng.uniform(0, 2 * np.pi, (2,))
+            noise += amp * np.sin(freq * X + ph[0]) * np.cos(freq * Y + ph[1])
+        return np.clip(base * 0.5 + noise, 0.0, 1.0)
+
+    # ── FIRELINE ADVISOR ──────────────────────────────────────────────────────
+    def _advise_firelines(self):
+        kf    = self.kf
+        fc    = self.fireline
+        theta = kf.orientation_rad
+        ct, st = math.cos(theta), math.sin(theta)
+        px, py = -st,  ct
+        qx, qy =  st, -ct
+        a, b   = kf.semi_major, kf.semi_minor
+        cx, cy = kf.cx, kf.cy
+        ros    = getattr(self, "_last_ros", 0.0)
+        intensity = fc.byram_intensity(ros)
+
+        off = b * 1.20
+        candidates = []
+
+        # 1: Left flank
+        back1 = (cx - a*ct + px*off, cy - a*st + py*off)
+        head1 = (cx + a*ct + px*off, cy + a*st + py*off)
+        steep = self.terrain.slope_deg > 20
+        r1 = ("Caution: steep slope slows crews" if steep
+              else "Preferred: parallel to spread, anchored at back-of-fire")
+        candidates.append(dict(
+            anchor=back1, tip=head1,
+            length=math.hypot(head1[0]-back1[0], head1[1]-back1[1]),
+            color="#00E676", rank=1, label="FL-1  Left flank", reason=r1))
+
+        # 2: Right flank
+        back2 = (cx - a*ct + qx*off, cy - a*st + qy*off)
+        head2 = (cx + a*ct + qx*off, cy + a*st + qy*off)
+        low_fuel = self.terrain.effective_mult() < 0.8
+        r2 = ("Low fuel load reduces fireline intensity" if low_fuel
+              else "Secondary option if left flank inaccessible")
+        candidates.append(dict(
+            anchor=back2, tip=head2,
+            length=math.hypot(head2[0]-back2[0], head2[1]-back2[1]),
+            color="#FFD600", rank=2, label="FL-2  Right flank", reason=r2))
+
+        # 3: Indirect intercept ahead of head fire
+        adv = a * 2.0
+        mid3  = (cx + ct*adv,        cy + st*adv)
+        back3 = (mid3[0] + px*b*2,   mid3[1] + py*b*2)
+        head3 = (mid3[0] + qx*b*2,   mid3[1] + qy*b*2)
+        r3 = ("Required: intensity too high for direct attack — NWCG PMS 410-1"
+              if intensity >= fc.THRESH_DOZER
+              else "Use if flanks inaccessible; requires rapid deployment")
+        candidates.append(dict(
+            anchor=back3, tip=head3,
+            length=math.hypot(head3[0]-back3[0], head3[1]-back3[1]),
+            color="#FF6D00", rank=3, label="FL-3  Indirect intercept", reason=r3))
+
+        return candidates
+
+    # ── _BUILD_FIGURE ──────────────────────────────────────────────────────────
     def _build_figure(self):
         plt.ion()
-        self.fig = plt.figure(figsize=(19, 9), facecolor="#13132a")
-        gs = self.fig.add_gridspec(
-            2, 3, left=0.05, right=0.97, top=0.93, bottom=0.07,
-            hspace=0.40, wspace=0.30,
-            width_ratios=[2.2, 1, 1],
+        self.fig = plt.figure(figsize=(20, 11), facecolor="#0d0f1a")
+        self.fig.subplots_adjust(left=0.03, right=0.72, top=0.95, bottom=0.04)
+        self._SPAN = 650
+
+        # Main map
+        self.ax = self.fig.add_axes([0.03, 0.04, 0.66, 0.89])
+        self.ax.set_facecolor("#0d0f1a")
+        self.ax.set_aspect("equal")
+        for sp in self.ax.spines.values():
+            sp.set_color("#1e2240")
+        self.ax.tick_params(colors="#3a3f6a", labelsize=7)
+        self.ax.set_xlabel("X (m)", color="#3a3f6a", fontsize=8)
+        self.ax.set_ylabel("Y (m)", color="#3a3f6a", fontsize=8)
+        self.ax.set_xlim(-80, self._SPAN)
+        self.ax.set_ylim(-80, self._SPAN)
+
+        # Terrain layers
+        print("  Generating terrain layer...")
+        X, Y, Z, shade = self._make_terrain(span=self._SPAN)
+        self._terrain_xyz = (X, Y, Z)
+        self.ax.imshow(shade, extent=[-80, self._SPAN, -80, self._SPAN],
+                       origin="lower", cmap="gray", vmin=0, vmax=1,
+                       alpha=0.55, zorder=1, interpolation="bilinear")
+        self.ax.imshow(Z, extent=[-80, self._SPAN, -80, self._SPAN],
+                       origin="lower", cmap="YlOrBr", alpha=0.35,
+                       zorder=2, interpolation="bilinear")
+        cl = self.ax.contour(X, Y, Z, levels=10, colors="#ffffff",
+                             alpha=0.18, linewidths=0.6, zorder=3)
+        self.ax.clabel(cl, inline=True, fontsize=5, fmt="%.0fm",
+                       colors="#cccccc")
+
+        # Fuel density overlay
+        fuel = self._fuel_alpha_map(X, Y)
+        self.ax.imshow(fuel, extent=[-80, self._SPAN, -80, self._SPAN],
+                       origin="lower", cmap="Greens", alpha=0.22,
+                       vmin=0, vmax=1, zorder=4, interpolation="bilinear")
+
+        # Fire patches
+        self._pred_patches = []
+        self._patch_fire = Ellipse((0, 0), 1, 1, angle=0,
+                                   facecolor="#FF3D00", alpha=0.85, zorder=8)
+        self._patch_glow = [
+            Ellipse((0, 0), 1, 1, angle=0, facecolor="none",
+                    edgecolor="#FF6D00", alpha=0.25 - 0.07*i,
+                    linewidth=4 - i, zorder=7)
+            for i in range(3)]
+        self._patch_uncert = Ellipse((0, 0), 1, 1, angle=0,
+                                     edgecolor="#FFD600", facecolor="none",
+                                     linestyle="--", linewidth=1.2,
+                                     alpha=0.45, zorder=9)
+        self._patch_sz = Ellipse((0, 0), 1, 1, angle=0,
+                                  edgecolor="#00B0FF", facecolor="#00B0FF",
+                                  alpha=0.08, linewidth=1.4,
+                                  linestyle=":", zorder=9)
+        for p in ([self._patch_fire, self._patch_uncert, self._patch_sz]
+                  + self._patch_glow):
+            self.ax.add_patch(p)
+
+        self._quiver = self.ax.quiver(
+            self._SPAN - 60, self._SPAN - 60, 0, 0,
+            color="#64B5F6", scale=200, width=0.005,
+            headwidth=5, headlength=6, zorder=12)
+        self.ax.text(self._SPAN - 60, self._SPAN - 28, "WIND",
+                     color="#64B5F6", fontsize=6.5, ha="center",
+                     va="bottom", zorder=12)
+
+        self._fl_artists = []
+        self._obs_artists = {}
+
+        # Right panel — three stacked info boxes
+        px0, pw = 0.73, 0.265
+
+        hdr = self.fig.add_axes([px0, 0.93, pw, 0.05])
+        hdr.axis("off")
+        hdr.text(0.5, 0.5, "FERDA  Decision Support",
+                 ha="center", va="center", fontsize=11,
+                 fontweight="bold", color="#E8EAF6")
+
+        def _panel(y, h, title):
+            a = self.fig.add_axes([px0, y, pw, h])
+            a.set_facecolor("#10122a")
+            for sp in a.spines.values():
+                sp.set_color("#1e2240")
+            a.axis("off")
+            a.text(0.04, 0.97, title, transform=a.transAxes,
+                   fontsize=8, fontweight="bold", color="#90CAF9", va="top")
+            return a.text(0.04, 0.83, "", transform=a.transAxes,
+                          fontsize=8.5, va="top", color="#E8EAF6",
+                          fontfamily="monospace", linespacing=1.7)
+
+        self._txt_status = _panel(0.63, 0.29, "FIRE STATUS")
+        self._txt_spread = _panel(0.35, 0.27, "SPREAD FORECAST")
+        self._txt_fireln = _panel(0.04, 0.30, "FIRELINE RECOMMENDATIONS")
+
+    # ── RENDER ────────────────────────────────────────────────────────────────
+    def render(self):
+        kf    = self.kf
+        theta = kf.orientation_rad
+        ct, st = math.cos(theta), math.sin(theta)
+        deg   = math.degrees(theta)
+
+        risk_lvl = self.risk.assess(
+            kf, self.terrain, self.wind_speed, self.current_time)
+        RCOL = {"none":"#4CAF50","low":"#4CAF50","medium":"#FFB300",
+                "high":"#FF6D00","critical":"#D500F9"}
+        fire_col = RCOL.get(risk_lvl, "#FF3D00")
+
+        ros_now   = getattr(self, "_last_ros", 0.0)
+        intensity = self.fireline.byram_intensity(ros_now)
+        flame_len = self.fireline.flame_length(intensity)
+        sz_rad    = self.fireline.safety_zone_radius(flame_len)
+        atk_str, _ = self.fireline.attack_method(intensity)
+
+        # Current fire ellipse + glow
+        for p in [self._patch_fire] + self._patch_glow:
+            p.center = (kf.cx, kf.cy)
+            p.width  = kf.semi_major * 2
+            p.height = kf.semi_minor * 2
+            p.angle  = deg
+        self._patch_fire.set_facecolor(fire_col)
+
+        pos_std = math.sqrt(kf.P[0, 0] + kf.P[1, 1])
+        self._patch_uncert.center = (kf.cx, kf.cy)
+        self._patch_uncert.width  = kf.semi_major * 2 + pos_std * 2
+        self._patch_uncert.height = kf.semi_minor * 2 + pos_std * 2
+        self._patch_uncert.angle  = deg
+
+        bx = kf.cx - kf.semi_major * ct
+        by = kf.cy - kf.semi_major * st
+        self._patch_sz.center = (bx, by)
+        d = max(sz_rad * 2, 5)
+        self._patch_sz.width = d; self._patch_sz.height = d
+
+        # Ghost trail
+        ghost = Ellipse((kf.cx, kf.cy), kf.semi_major*2, kf.semi_minor*2,
+                        angle=deg, edgecolor=fire_col, facecolor="none",
+                        alpha=0.06, linestyle=":", linewidth=0.8, zorder=6)
+        self.ax.add_patch(ghost)
+
+        # Predicted spread ellipses (1h / 3h / 6h)
+        for p in self._pred_patches:
+            p.remove()
+        self._pred_patches = []
+        for dt_sec, alpha, lbl in [(3600, 0.18, "1h"),
+                                   (10800, 0.11, "3h"),
+                                   (21600, 0.06, "6h")]:
+            dx, dy, da, db, _ = self.spread.compute_increments(
+                self.wind_speed, self.wind_dir,
+                self.terrain.slope_deg, dt_sec)
+            pa = max(kf.semi_major + da, 1)
+            pb = max(kf.semi_minor + db, 1)
+            ep = Ellipse((kf.cx + dx, kf.cy + dy), pa*2, pb*2,
+                         angle=deg, facecolor=fire_col,
+                         edgecolor="none", alpha=alpha, zorder=5)
+            self.ax.add_patch(ep)
+            self._pred_patches.append(ep)
+            lx = kf.cx + dx + pa * ct
+            ly = kf.cy + dy + pa * st
+            if -80 < lx < self._SPAN and -80 < ly < self._SPAN:
+                self.ax.text(lx, ly, lbl, fontsize=6, color="#FFCC02",
+                             ha="center", va="bottom", zorder=13,
+                             fontweight="bold")
+
+        # Wind
+        self._quiver.set_UVC(
+            math.cos(math.radians(self.wind_dir)) * self.wind_speed,
+            math.sin(math.radians(self.wind_dir)) * self.wind_speed)
+
+        # Drone markers
+        drone_cols = ["#FF80AB","#80D8FF","#CCFF90","#FFD180","#EA80FC"]
+        for obs in self.observations[-30:]:
+            did = obs.drone_id
+            col = drone_cols[did % len(drone_cols)]
+            if did not in self._obs_artists:
+                ln, = self.ax.plot([], [], marker="x", markersize=9,
+                                   linewidth=0, color=col, zorder=11,
+                                   markeredgewidth=2)
+                self._obs_artists[did] = ln
+            pts = [(o.x, o.y) for o in self.observations if o.drone_id==did]
+            if pts:
+                self._obs_artists[did].set_data(*zip(*pts))
+
+        # Firelines
+        candidates = self._advise_firelines()
+        for (ln, mk) in self._fl_artists:
+            try: ln.remove()
+            except Exception: pass
+            try: mk.remove()
+            except Exception: pass
+        self._fl_artists = []
+        for c in candidates:
+            ax0, ti = c["anchor"], c["tip"]
+            ln, = self.ax.plot([ax0[0], ti[0]], [ax0[1], ti[1]],
+                               color=c["color"], linewidth=2.8,
+                               linestyle="-", zorder=10)
+            mk, = self.ax.plot(ax0[0], ax0[1], marker="^",
+                               color=c["color"], markersize=9,
+                               zorder=11, linewidth=0)
+            self._fl_artists.append((ln, mk))
+
+        # Map title
+        wx = getattr(self.terrain, "weather", None)
+        wx_s = (f"  |  {wx.description}  {wx.wind_speed:.1f}m/s  RH{wx.humidity:.0f}%"
+                if wx and wx.wind_speed > 0 else "")
+        self.ax.set_title(
+            f"{self.terrain.land_cover_name}"
+            f"  ({self.terrain.lat:.4f}N, {abs(self.terrain.lon):.4f}W)"
+            f"{wx_s}",
+            color="#B0BEC5", fontsize=8.5, pad=6)
+
+        # STATUS panel
+        conf    = kf.confidence_pct
+        nis_str = f"{kf.last_nis:.1f}" if kf.last_nis is not None else "n/a"
+        conf_col = "#4CAF50" if conf > 70 else "#FFB300" if conf > 40 else "#FF5252"
+        self._txt_status.set_text(
+            f"Time   {self.current_time:>8.0f} s\n"
+            f"Risk   {risk_lvl.upper()}\n"
+            f"Conf   {conf:>7.1f}%  (NIS {nis_str})\n"
+            f"Center ({kf.cx:.0f}, {kf.cy:.0f}) m\n"
+            f"Axes   {kf.semi_major:.0f} x {kf.semi_minor:.0f} m\n"
+            f"Area   {kf.area_m2/10_000:.3f} ha\n"
+            f"Wind   {self.wind_speed:.1f} m/s @ {self.wind_dir:.0f} deg\n"
+            f"Slope  {self.terrain.slope_deg:.1f} deg"
         )
-        self.ax_map    = self.fig.add_subplot(gs[:, 0])   # Main fire map
-        self.ax_growth = self.fig.add_subplot(gs[0, 1])   # Axis growth chart
-        self.ax_area   = self.fig.add_subplot(gs[1, 1])   # Area / ha chart
-        self.ax_alerts = self.fig.add_subplot(gs[:, 2])   # Alerts / info panel
+        self._txt_status.set_color(conf_col)
 
-        dark_bg = "#0d0d1f"
-        for ax in (self.ax_map, self.ax_growth, self.ax_area, self.ax_alerts):
-            ax.set_facecolor(dark_bg)
-            for sp in ax.spines.values():
-                sp.set_color("#33335a")
-            ax.tick_params(colors="#9999bb", labelsize=7)
-            ax.xaxis.label.set_color("#9999bb")
-            ax.yaxis.label.set_color("#9999bb")
-
-        # -- Map panel --------------------------------------------------------
-        SPAN = 650
-        self.ax_map.set_xlim(-80, SPAN)
-        self.ax_map.set_ylim(-80, SPAN)
-        self.ax_map.set_aspect("equal")
-        self.ax_map.set_xlabel("X (m)", fontsize=8)
-        self.ax_map.set_ylabel("Y (m)", fontsize=8)
-        self.ax_map.grid(True, alpha=0.12, color="#33335a", linewidth=0.6)
-
-        # Terrain info banner
-        risk_col = RISK_COLORS.get(self.terrain.risk_level, "#FFC000")
-        self.ax_map.text(
-            0.01, 0.995,
-            f"[crop] {self.terrain.land_cover_name}  ·  Soil: {self.terrain.soil_name[:28]}\n"
-            f"Fuel ×{self.terrain.fuel_mult:.1f}  ·  Effective ×{self.terrain.effective_mult():.2f}"
-            f"  ·  Moisture {self.terrain.soil_moisture:.0%}"
-            + ("  ·  ! Water barrier" if self.terrain.has_water_nearby else ""),
-            transform=self.ax_map.transAxes, fontsize=7.8, va="top",
-            color="#ccccee",
-            bbox=dict(facecolor="#1e1e3a", edgecolor=risk_col, alpha=0.92, pad=3),
+        # SPREAD FORECAST panel
+        rows = []
+        for dt_sec, lbl in [(3600,"1 hr"), (10800,"3 hr"), (21600,"6 hr")]:
+            _, _, da, db, _ = self.spread.compute_increments(
+                self.wind_speed, self.wind_dir,
+                self.terrain.slope_deg, dt_sec)
+            pa = kf.semi_major + da
+            pb = kf.semi_minor + db
+            ha = math.pi * pa * pb / 10_000
+            rows.append(f"{lbl}  {pa:.0f}x{pb:.0f}m  {ha:.2f}ha")
+        self._txt_spread.set_text(
+            "Horizon  Axes          Area\n"
+            + "\n".join(rows)
+            + f"\n\nByram I  {intensity:.0f} kW/m\n"
+            + f"Flame    {flame_len:.1f} m\n"
+            + f"Safety r {sz_rad:.0f} m  (4x flame)"
         )
 
-        # Fire ellipse
-        ix, iy = self.kf.cx, self.kf.cy
-        self.patch_fire = Ellipse(
-            (ix, iy), self.kf.semi_major * 2, self.kf.semi_minor * 2,
-            angle=0, color="#FF4500", alpha=0.72, zorder=5,
-        )
-        self.ax_map.add_patch(self.patch_fire)
+        # FIRELINE RECOMMENDATIONS panel
+        fl_txt = [f"Attack mode:\n  {atk_str}\n"]
+        for c in candidates:
+            fl_txt.append(
+                f"[{c['rank']}] {c['label']}\n"
+                f"    {c['reason'][:58]}\n"
+                f"    Length: {c['length']:.0f} m\n"
+            )
+        self._txt_fireln.set_text("\n".join(fl_txt))
 
-        # Uncertainty ellipse (2-sigma shell)
-        self.patch_uncert = Ellipse(
-            (ix, iy), self.kf.semi_major * 2 + 12, self.kf.semi_minor * 2 + 12,
-            angle=0, edgecolor="#FFD700", facecolor="none",
-            alpha=0.45, linestyle="--", linewidth=1.2, zorder=4,
-        )
-        self.ax_map.add_patch(self.patch_uncert)
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        plt.pause(0.04)
 
-        # Wind quiver (top-right corner)
-        self.quiver = self.ax_map.quiver(
-            SPAN - 60, SPAN - 60, 0, 0,
-            color="#00BFFF", scale=250, width=0.006,
-            headwidth=4, headlength=5, zorder=7,
-        )
-        self.ax_map.text(SPAN - 60, SPAN - 30, "Wind", color="#00BFFF",
-                         fontsize=7, ha="center", va="bottom")
+    # -- HELPERS --------------------------------------------------------------
 
-        # Status text box
-        self.txt_status = self.ax_map.text(
-            0.01, 0.86, "", transform=self.ax_map.transAxes,
-            fontsize=8.5, fontweight="bold", va="top", color="white",
-            bbox=dict(facecolor="#1e1e3a", edgecolor="#444466", alpha=0.90, pad=4),
-        )
-
-        # Per-drone observation markers (populated on first observation)
-        self.obs_artists: dict = {}
-
-        # Legend
-        legend_patches = [
-            mpatches.Patch(color="#FF4500", alpha=0.7,  label="Fire Perimeter"),
-            mpatches.Patch(edgecolor="#FFD700", facecolor="none",
-                           linestyle="--", linewidth=1.2, label="2σ Uncertainty"),
-        ]
-        self.ax_map.legend(
-            handles=legend_patches, loc="lower right", fontsize=7,
-            facecolor="#1e1e3a", edgecolor="#444466", labelcolor="#ccccee",
-        )
-
-        # -- Growth chart -----------------------------------------------------
-        self.ax_growth.set_title("Fire Axes (m)", color="#ccccee", fontsize=8, pad=3)
-        self.ax_growth.set_xlabel("Time (s)", fontsize=7)
-        self.ax_growth.grid(True, alpha=0.18, color="#33335a")
-        self.ln_major, = self.ax_growth.plot([], [], color="#FF4500", lw=1.6, label="Semi-major")
-        self.ln_minor, = self.ax_growth.plot([], [], color="#FFD700", lw=1.2,
-                                              linestyle="--", label="Semi-minor")
-        self.ax_growth.legend(facecolor="#0d0d1f", edgecolor="#33335a",
-                               labelcolor="#ccccee", fontsize=6.5)
-
-        # -- Area chart -------------------------------------------------------
-        self.ax_area.set_title("Fire Area (ha)", color="#ccccee", fontsize=8, pad=3)
-        self.ax_area.set_xlabel("Time (s)", fontsize=7)
-        self.ax_area.grid(True, alpha=0.18, color="#33335a")
-        self.ln_area, = self.ax_area.plot([], [], color="#9B00FF", lw=1.5)
-
-        # -- Alerts panel ------------------------------------------------------
-        self.ax_alerts.axis("off")
-        self.ax_alerts.set_title("System Alerts & State", color="#ccccee",
-                                  fontsize=8.5, pad=6)
-        self.txt_alerts = self.ax_alerts.text(
-            0.04, 0.97, "", transform=self.ax_alerts.transAxes,
-            fontsize=6.8, va="top", color="#ccccee", fontfamily="monospace",
-            linespacing=1.55,
-        )
-
-    # -- PREDICT --------------------------------------------------------------
+    # -- PREDICT -------------------------------------------------------------
     def predict(self, dt: float, wind_speed: float, wind_dir: float, slope: float):
         self.wind_speed = wind_speed
         self.wind_dir   = wind_dir
@@ -927,117 +1306,19 @@ class FERDA_System:
             wind_speed, wind_dir, slope, dt)
         self.kf.predict(dx, dy, da, db, theta)
         self.current_time += dt
+        self._last_ros = da / dt if dt > 0 else 0.0
         self._record()
 
-    # -- UPDATE ---------------------------------------------------------------
+    # -- UPDATE --------------------------------------------------------------
     def update(self, obs: DroneObservation):
         obs.timestamp = self.current_time
         self.observations.append(obs)
         self.kf.update(obs)
 
-    # -- RENDER ---------------------------------------------------------------
-    def render(self):
-        kf  = self.kf
-        ts  = [h["t"] for h in self.history]
-        mas = [h["a"] for h in self.history]
-        mis = [h["b"] for h in self.history]
-        ars = [h["area"] / 10_000 for h in self.history]
-
-        # Risk assessment
-        risk_lvl = self.risk.assess(kf, self.terrain, self.wind_speed, self.current_time)
-        fire_col = RISK_COLORS.get(risk_lvl, "#FF4500")
-
-        # Fire ellipse
-        self.patch_fire.center  = (kf.cx, kf.cy)
-        self.patch_fire.width   = kf.semi_major * 2
-        self.patch_fire.height  = kf.semi_minor * 2
-        self.patch_fire.angle   = math.degrees(kf.orientation_rad)
-        self.patch_fire.set_facecolor(fire_col)
-
-        # Uncertainty ellipse — scale with positional uncertainty
-        pos_std = math.sqrt(kf.P[0, 0] + kf.P[1, 1])
-        self.patch_uncert.center = (kf.cx, kf.cy)
-        self.patch_uncert.width  = kf.semi_major * 2 + pos_std * 2
-        self.patch_uncert.height = kf.semi_minor * 2 + pos_std * 2
-        self.patch_uncert.angle  = math.degrees(kf.orientation_rad)
-
-        # Ghost trail
-        ghost = Ellipse(
-            (kf.cx, kf.cy), kf.semi_major * 2, kf.semi_minor * 2,
-            angle=math.degrees(kf.orientation_rad),
-            edgecolor=fire_col, facecolor="none", alpha=0.07,
-            linestyle=":", linewidth=0.8, zorder=3,
-        )
-        self.ax_map.add_patch(ghost)
-
-        # Wind arrow
-        theta = math.radians(self.wind_dir)
-        self.quiver.set_UVC(
-            math.cos(theta) * self.wind_speed,
-            math.sin(theta) * self.wind_speed,
-        )
-
-        # Drone observation markers
-        drone_colors = plt.cm.Set2.colors
-        for obs in self.observations[-20:]:
-            did = obs.drone_id
-            col = drone_colors[did % len(drone_colors)]
-            if did not in self.obs_artists:
-                ln, = self.ax_map.plot(
-                    [], [], marker="x", markersize=9, linewidth=0,
-                    color=col, zorder=8, markeredgewidth=2,
-                    label=f"Drone {did}",
-                )
-                self.obs_artists[did] = ln
-            pts = [(o.x, o.y) for o in self.observations if o.drone_id == did]
-            xs, ys = zip(*pts)
-            self.obs_artists[did].set_data(xs, ys)
-
-        # Growth charts
-        self.ln_major.set_data(ts, mas)
-        self.ln_minor.set_data(ts, mis)
-        self.ln_area.set_data(ts, ars)
-        for ax in (self.ax_growth, self.ax_area):
-            ax.relim(); ax.autoscale_view()
-
-        # Status text
-        conf    = kf.confidence_pct
-        c_color = "#00FF7F" if conf > 70 else "#FFA500" if conf > 40 else "#FF4444"
-        nis_str = f"{kf.last_nis:.1f}" if kf.last_nis is not None else "n/a"
-        wx = getattr(self.terrain, "weather", None)
-        wx_line = (f"{wx.description} | RH:{wx.humidity:.0f}% | T:{wx.temperature:.1f}C"
-                   if wx and wx.wind_speed > 0 else "Weather: not fetched")
-        self.txt_status.set_text(
-            f"[t]  {self.current_time:.0f} s\n"
-            f"Conf  {conf:.1f}%   Risk: {risk_lvl.upper()}\n"
-            f"NIS   {nis_str}  (expect < 7.8)\n"
-            f"CX {kf.cx:.1f} m   CY {kf.cy:.1f} m\n"
-            f"a={kf.semi_major:.1f}m  b={kf.semi_minor:.1f}m\n"
-            f"Area  {kf.area_m2/10_000:.3f} ha\n"
-            f"Wind  {self.wind_speed:.1f} m/s @ {self.wind_dir:.0f}\u00b0\n"
-            f"{wx_line}"
-        )
-        self.txt_status.set_color(c_color)
-
-        # Alerts panel
-        recent = self.risk.alerts[-10:]
-        lines = [f"[{a.level:8s}] t={a.time:5.0f}s\n  {a.message[:42]}"
-                 for a in reversed(recent)]
-        self.txt_alerts.set_text("\n".join(lines) if lines else "No alerts yet.")
-
-        # Title
-        self.ax_map.set_title(
-            f"FERDA v2.0  ·  {self.terrain.land_cover_name}"
-            f"  ·  ({self.terrain.lat:.4f}°N, {abs(self.terrain.lon):.4f}°W)",
-            color="#ddddff", fontsize=10, fontweight="bold",
-        )
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
-        plt.pause(0.04)
-
-    # -- HELPERS --------------------------------------------------------------
     def _record(self):
-        kf = self.kf
+        kf  = self.kf
+        ros = getattr(self, "_last_ros", 0.0)
+        self.intensity_history.append(self.fireline.byram_intensity(ros))
         self.history.append({
             "t": self.current_time,
             "a": kf.semi_major,
@@ -1197,6 +1478,6 @@ def main():
         plt.ioff()
         plt.show()
 
-
 if __name__ == "__main__":
     main()
+    
