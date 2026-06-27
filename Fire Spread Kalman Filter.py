@@ -898,14 +898,14 @@ class FERDA_System:
     def _fetch_topo_grid(self, n: int = 16):
         """
         Queries open-elevation.com for an n x n elevation grid centred on
-        the fire origin, spanning the map SPAN in local metres.
+        the fire origin, spanning a SYMMETRIC square of
+        +/- self._TERRAIN_HALF_SPAN metres around (0,0).
         Converts local (x, y) metres to WGS84 offsets, batches into one
         POST request, and returns (X, Y, Z) numpy arrays for contour plotting.
-        SPAN = 650 m from _build_figure.
         """
-        SPAN = 650
-        xs = np.linspace(-80, SPAN, n)
-        ys = np.linspace(-80, SPAN, n)
+        H = getattr(self, "_TERRAIN_HALF_SPAN", 500)
+        xs = np.linspace(-H, H, n)
+        ys = np.linspace(-H, H, n)
         lat0, lon0 = self.terrain.lat, self.terrain.lon
         # 1 degree lat ~= 111,320 m; 1 degree lon ~= 111,320 * cos(lat) m
         dlat_per_m = 1.0 / 111_320.0
@@ -939,11 +939,18 @@ class FERDA_System:
 
     # -- FIGURE ---------------------------------------------------------------
     # ── PROCEDURAL TERRAIN ────────────────────────────────────────────────────
-    def _make_terrain(self, span=650, n=200):
-        xs = np.linspace(-80, span, n)
-        ys = np.linspace(-80, span, n)
+    # Below this total relief (m), real elevation data is mostly sensor noise/
+    # interpolation artifacts rather than meaningful terrain — treat as flat.
+    FLAT_RELIEF_THRESHOLD_M = 3.0
+
+    def _make_terrain(self, span=None, n=200):
+        H = getattr(self, "_TERRAIN_HALF_SPAN", 500)
+        xs = np.linspace(-H, H, n)
+        ys = np.linspace(-H, H, n)
         X, Y = np.meshgrid(xs, ys)
         topo = self._fetch_topo_grid(n=18)
+        self.is_flat_terrain = False
+
         if topo is not None:
             try:
                 from scipy.interpolate import RegularGridInterpolator
@@ -952,8 +959,23 @@ class FERDA_System:
                     (Xc[0, :], Yc[:, 0]), Zc.T,
                     method='linear', bounds_error=False, fill_value=None)
                 Z = rgi((X, Y))
+                # Real elevation data is coarse (often 30-90m source resolution)
+                # interpolated onto a fine grid — this produces fake banding.
+                # Gaussian-smooth to remove interpolation/quantization artifacts.
+                try:
+                    from scipy.ndimage import gaussian_filter
+                    Z = gaussian_filter(Z, sigma=max(n / 25, 3))
+                except ImportError:
+                    pass
+                relief = float(np.nanmax(Z) - np.nanmin(Z))
+                if relief < self.FLAT_RELIEF_THRESHOLD_M:
+                    # Relief this small is noise, not real terrain shape.
+                    # Flatten completely rather than show misleading banding.
+                    self.is_flat_terrain = True
+                    Z = np.full_like(Z, np.nanmean(Z))
             except Exception:
                 topo = None
+
         if topo is None:
             rng = np.random.default_rng(
                 int(abs(self.terrain.lat * 1000) + abs(self.terrain.lon * 1000)))
@@ -962,6 +984,7 @@ class FERDA_System:
                 ph = rng.uniform(0, 2 * np.pi, (2,))
                 Z += amp * (np.sin(freq * X + ph[0]) * np.cos(freq * Y + ph[1]))
             Z -= Z.min()
+
         dz_dx = np.gradient(Z, axis=1)
         dz_dy = np.gradient(Z, axis=0)
         sun = np.array([-1.0, -1.0, 2.0])
@@ -971,6 +994,8 @@ class FERDA_System:
         nlen[nlen == 0] = 1.0
         norm /= nlen
         shade = np.clip((norm * sun).sum(axis=-1), 0.0, 1.0)
+        if self.is_flat_terrain:
+            shade = np.full_like(shade, 0.75)   # flat, evenly lit
         return X, Y, Z, shade
 
     def _fuel_alpha_map(self, X, Y):
@@ -1040,7 +1065,12 @@ class FERDA_System:
         plt.ion()
         self.fig = plt.figure(figsize=(20, 11), facecolor="#0d0f1a")
         self.fig.subplots_adjust(left=0.03, right=0.72, top=0.95, bottom=0.04)
-        self._SPAN = 650
+        # Terrain is rendered as a SYMMETRIC square centred on the fire
+        # origin (0,0), not an offset [-80, 650] box -- that put the fire
+        # near the corner instead of the middle, wasting most of the
+        # available buffer before dynamic zoom hit the edge.
+        self._TERRAIN_HALF_SPAN = 500
+        self._SPAN = self._TERRAIN_HALF_SPAN   # kept for compatibility
 
         # Main map
         self.ax = self.fig.add_axes([0.03, 0.04, 0.66, 0.89])
@@ -1051,39 +1081,55 @@ class FERDA_System:
         self.ax.tick_params(colors="#3a3f6a", labelsize=7)
         self.ax.set_xlabel("X (m)", color="#3a3f6a", fontsize=8)
         self.ax.set_ylabel("Y (m)", color="#3a3f6a", fontsize=8)
-        self.ax.set_xlim(-80, self._SPAN)
-        self.ax.set_ylim(-80, self._SPAN)
+        self.ax.set_xlim(-100, 100)   # placeholder; render() sets real zoom
+        self.ax.set_ylim(-100, 100)
 
         # Terrain layers
         print("  Generating terrain layer...")
         X, Y, Z, shade = self._make_terrain(span=self._SPAN)
         self._terrain_xyz = (X, Y, Z)
-        self.ax.imshow(shade, extent=[-80, self._SPAN, -80, self._SPAN],
-                       origin="lower", cmap="gray", vmin=0, vmax=1,
-                       alpha=0.55, zorder=1, interpolation="bilinear")
-        self.ax.imshow(Z, extent=[-80, self._SPAN, -80, self._SPAN],
-                       origin="lower", cmap="YlOrBr", alpha=0.35,
-                       zorder=2, interpolation="bilinear")
-        cl = self.ax.contour(X, Y, Z, levels=10, colors="#ffffff",
-                             alpha=0.18, linewidths=0.6, zorder=3)
-        self.ax.clabel(cl, inline=True, fontsize=5, fmt="%.0fm",
-                       colors="#cccccc")
+
+        if getattr(self, "is_flat_terrain", False):
+            # Real elevation data showed <3m relief -- that's noise, not
+            # terrain. Show a flat neutral ground colour instead of fake
+            # contours/banding, and say so plainly.
+            self.ax.imshow(np.ones_like(Z) * 0.6,
+                           extent=[-self._TERRAIN_HALF_SPAN, self._TERRAIN_HALF_SPAN,
+                               -self._TERRAIN_HALF_SPAN, self._TERRAIN_HALF_SPAN],
+                           origin="lower", cmap="gray", vmin=0, vmax=1,
+                           alpha=0.30, zorder=1)
+            self.ax.text(0.015, 0.985, "Terrain: flat (<3m relief)",
+                         transform=self.ax.transAxes, fontsize=7,
+                         color="#788", va="top", ha="left", zorder=20)
+        else:
+            self.ax.imshow(shade, extent=[-self._TERRAIN_HALF_SPAN, self._TERRAIN_HALF_SPAN,
+                               -self._TERRAIN_HALF_SPAN, self._TERRAIN_HALF_SPAN],
+                           origin="lower", cmap="gray", vmin=0, vmax=1,
+                           alpha=0.55, zorder=1, interpolation="bilinear")
+            im = self.ax.imshow(Z, extent=[-self._TERRAIN_HALF_SPAN, self._TERRAIN_HALF_SPAN,
+                               -self._TERRAIN_HALF_SPAN, self._TERRAIN_HALF_SPAN],
+                                origin="lower", cmap="YlOrBr", alpha=0.35,
+                                zorder=2, interpolation="bilinear")
+            cl = self.ax.contour(X, Y, Z, levels=5, colors="#ffffff",
+                                 alpha=0.20, linewidths=0.6, zorder=3)
+            self.ax.clabel(cl, cl.levels[::2], inline=True, fontsize=5,
+                           fmt="%.0fm", colors="#999999")
+            cbar = self.fig.colorbar(im, ax=self.ax, fraction=0.025, pad=0.01)
+            cbar.set_label("Elevation (m ASL)", color="#3a3f6a", fontsize=6.5)
+            cbar.ax.tick_params(colors="#3a3f6a", labelsize=5.5)
 
         # Fuel density overlay
         fuel = self._fuel_alpha_map(X, Y)
-        self.ax.imshow(fuel, extent=[-80, self._SPAN, -80, self._SPAN],
+        self.ax.imshow(fuel, extent=[-self._TERRAIN_HALF_SPAN, self._TERRAIN_HALF_SPAN,
+                               -self._TERRAIN_HALF_SPAN, self._TERRAIN_HALF_SPAN],
                        origin="lower", cmap="Greens", alpha=0.22,
                        vmin=0, vmax=1, zorder=4, interpolation="bilinear")
 
         # Fire patches
         self._pred_patches = []
         self._patch_fire = Ellipse((0, 0), 1, 1, angle=0,
-                                   facecolor="#FF3D00", alpha=0.85, zorder=8)
-        self._patch_glow = [
-            Ellipse((0, 0), 1, 1, angle=0, facecolor="none",
-                    edgecolor="#FF6D00", alpha=0.25 - 0.07*i,
-                    linewidth=4 - i, zorder=7)
-            for i in range(3)]
+                                   facecolor="#FF3D00", edgecolor="#FFAB40",
+                                   linewidth=1.8, alpha=0.85, zorder=8)
         self._patch_uncert = Ellipse((0, 0), 1, 1, angle=0,
                                      edgecolor="#FFD600", facecolor="none",
                                      linestyle="--", linewidth=1.2,
@@ -1092,17 +1138,21 @@ class FERDA_System:
                                   edgecolor="#00B0FF", facecolor="#00B0FF",
                                   alpha=0.08, linewidth=1.4,
                                   linestyle=":", zorder=9)
-        for p in ([self._patch_fire, self._patch_uncert, self._patch_sz]
-                  + self._patch_glow):
+        for p in (self._patch_fire, self._patch_uncert, self._patch_sz):
             self.ax.add_patch(p)
+        # Ghost trail: capped rolling history, not infinite accumulation
+        self._ghost_patches = []
+        self._GHOST_MAX = 6
+        # Spread-prediction text labels, cleared and redrawn each frame
+        self._pred_labels = []
 
         self._quiver = self.ax.quiver(
-            self._SPAN - 60, self._SPAN - 60, 0, 0,
+            0, 0, 0, 0,
             color="#64B5F6", scale=200, width=0.005,
             headwidth=5, headlength=6, zorder=12)
-        self.ax.text(self._SPAN - 60, self._SPAN - 28, "WIND",
-                     color="#64B5F6", fontsize=6.5, ha="center",
-                     va="bottom", zorder=12)
+        self._wind_label = self.ax.text(
+            0, 0, "WIND", color="#64B5F6", fontsize=6.5,
+            ha="center", va="bottom", zorder=12)
 
         self._fl_artists = []
         self._obs_artists = {}
@@ -1116,7 +1166,7 @@ class FERDA_System:
                  ha="center", va="center", fontsize=11,
                  fontweight="bold", color="#E8EAF6")
 
-        def _panel(y, h, title):
+        def _panel(y, h, title, fontsize=8.5, linespacing=1.7):
             a = self.fig.add_axes([px0, y, pw, h])
             a.set_facecolor("#10122a")
             for sp in a.spines.values():
@@ -1124,13 +1174,18 @@ class FERDA_System:
             a.axis("off")
             a.text(0.04, 0.97, title, transform=a.transAxes,
                    fontsize=8, fontweight="bold", color="#90CAF9", va="top")
-            return a.text(0.04, 0.83, "", transform=a.transAxes,
-                          fontsize=8.5, va="top", color="#E8EAF6",
-                          fontfamily="monospace", linespacing=1.7)
+            return a.text(0.04, 0.87, "", transform=a.transAxes,
+                          fontsize=fontsize, va="top", color="#E8EAF6",
+                          fontfamily="monospace", linespacing=linespacing)
 
-        self._txt_status = _panel(0.63, 0.29, "FIRE STATUS")
-        self._txt_spread = _panel(0.35, 0.27, "SPREAD FORECAST")
-        self._txt_fireln = _panel(0.04, 0.30, "FIRELINE RECOMMENDATIONS")
+        # Fireline panel needs ~2x the vertical room (3 candidates x 3 lines
+        # each) compared to status/spread, which are fixed at ~8 lines each.
+        self._txt_status = _panel(0.70, 0.22, "FIRE STATUS",
+                                   fontsize=8.0, linespacing=1.55)
+        self._txt_spread = _panel(0.47, 0.21, "SPREAD FORECAST",
+                                   fontsize=8.0, linespacing=1.55)
+        self._txt_fireln = _panel(0.04, 0.41, "FIRELINE RECOMMENDATIONS",
+                                   fontsize=7.3, linespacing=1.42)
 
     # ── RENDER ────────────────────────────────────────────────────────────────
     def render(self):
@@ -1138,6 +1193,30 @@ class FERDA_System:
         theta = kf.orientation_rad
         ct, st = math.cos(theta), math.sin(theta)
         deg   = math.degrees(theta)
+
+        # -- Dynamic zoom: keep the fire framed at a useful scale --------------
+        # Track the largest extent the fire has reached (including the 6h
+        # prediction horizon) so the view doesn't jitter as the fire shrinks
+        # slightly between Kalman updates -- it only zooms OUT, never in,
+        # below a sensible minimum.
+        #
+        # HARD CAP: the rendered terrain image only covers a fixed area
+        # (self._TERRAIN_HALF_SPAN around the origin). If the computed zoom
+        # radius exceeds that, capping it here prevents the camera from
+        # showing empty background outside the terrain image -- which is
+        # what produced the "dark void" bug. The 6h spread ellipse may still
+        # extend past the terrain edge in extreme-wind scenarios; that's a
+        # visual edge case, not a black hole in the map.
+        dx6, dy6, da6, db6, _ = self.spread.compute_increments(
+            self.wind_speed, self.wind_dir, self.terrain.slope_deg, 21600)
+        reach = max(kf.semi_major + da6, kf.semi_minor + db6,
+                    abs(dx6), abs(dy6), 1.0)
+        raw_radius  = max(getattr(self, "_max_view_radius", 0.0), reach * 2.2, 40.0)
+        view_radius = min(raw_radius, self._TERRAIN_HALF_SPAN)
+        self._max_view_radius = view_radius
+        cx, cy = kf.cx, kf.cy
+        self.ax.set_xlim(cx - view_radius, cx + view_radius)
+        self.ax.set_ylim(cy - view_radius, cy + view_radius)
 
         risk_lvl = self.risk.assess(
             kf, self.terrain, self.wind_speed, self.current_time)
@@ -1151,12 +1230,11 @@ class FERDA_System:
         sz_rad    = self.fireline.safety_zone_radius(flame_len)
         atk_str, _ = self.fireline.attack_method(intensity)
 
-        # Current fire ellipse + glow
-        for p in [self._patch_fire] + self._patch_glow:
-            p.center = (kf.cx, kf.cy)
-            p.width  = kf.semi_major * 2
-            p.height = kf.semi_minor * 2
-            p.angle  = deg
+        # Current fire ellipse — single clean outline, no glow stack
+        self._patch_fire.center = (kf.cx, kf.cy)
+        self._patch_fire.width  = kf.semi_major * 2
+        self._patch_fire.height = kf.semi_minor * 2
+        self._patch_fire.angle  = deg
         self._patch_fire.set_facecolor(fire_col)
 
         pos_std = math.sqrt(kf.P[0, 0] + kf.P[1, 1])
@@ -1171,18 +1249,26 @@ class FERDA_System:
         d = max(sz_rad * 2, 5)
         self._patch_sz.width = d; self._patch_sz.height = d
 
-        # Ghost trail
+        # Ghost trail — capped rolling history (was unbounded, causing clutter)
         ghost = Ellipse((kf.cx, kf.cy), kf.semi_major*2, kf.semi_minor*2,
-                        angle=deg, edgecolor=fire_col, facecolor="none",
-                        alpha=0.06, linestyle=":", linewidth=0.8, zorder=6)
+                        angle=deg, edgecolor="#FF8A50", facecolor="none",
+                        alpha=0.10, linestyle=":", linewidth=0.8, zorder=6)
         self.ax.add_patch(ghost)
+        self._ghost_patches.append(ghost)
+        while len(self._ghost_patches) > self._GHOST_MAX:
+            old = self._ghost_patches.pop(0)
+            old.remove()
 
-        # Predicted spread ellipses (1h / 3h / 6h)
+        # Predicted spread ellipses (1h / 3h / 6h) — clear previous frame fully
         for p in self._pred_patches:
             p.remove()
         self._pred_patches = []
-        for dt_sec, alpha, lbl in [(3600, 0.18, "1h"),
-                                   (10800, 0.11, "3h"),
+        for lbl_txt in self._pred_labels:
+            lbl_txt.remove()
+        self._pred_labels = []
+
+        for dt_sec, alpha, lbl in [(3600, 0.16, "1h"),
+                                   (10800, 0.10, "3h"),
                                    (21600, 0.06, "6h")]:
             dx, dy, da, db, _ = self.spread.compute_increments(
                 self.wind_speed, self.wind_dir,
@@ -1191,20 +1277,28 @@ class FERDA_System:
             pb = max(kf.semi_minor + db, 1)
             ep = Ellipse((kf.cx + dx, kf.cy + dy), pa*2, pb*2,
                          angle=deg, facecolor=fire_col,
-                         edgecolor="none", alpha=alpha, zorder=5)
+                         edgecolor=fire_col, linewidth=0.6,
+                         alpha=alpha, zorder=5)
             self.ax.add_patch(ep)
             self._pred_patches.append(ep)
             lx = kf.cx + dx + pa * ct
             ly = kf.cy + dy + pa * st
-            if -80 < lx < self._SPAN and -80 < ly < self._SPAN:
-                self.ax.text(lx, ly, lbl, fontsize=6, color="#FFCC02",
-                             ha="center", va="bottom", zorder=13,
-                             fontweight="bold")
+            _xl, _yl = self.ax.get_xlim(), self.ax.get_ylim()
+            if _xl[0] < lx < _xl[1] and _yl[0] < ly < _yl[1]:
+                t = self.ax.text(lx, ly, lbl, fontsize=6.5, color="#FFCC02",
+                                 ha="center", va="bottom", zorder=13,
+                                 fontweight="bold")
+                self._pred_labels.append(t)
 
-        # Wind
+        # Wind — reposition into the top-right corner of the CURRENT zoomed view
+        xlim = self.ax.get_xlim(); ylim = self.ax.get_ylim()
+        wx_pos = xlim[1] - (xlim[1]-xlim[0]) * 0.08
+        wy_pos = ylim[1] - (ylim[1]-ylim[0]) * 0.08
+        self._quiver.set_offsets([[wx_pos, wy_pos]])
         self._quiver.set_UVC(
             math.cos(math.radians(self.wind_dir)) * self.wind_speed,
             math.sin(math.radians(self.wind_dir)) * self.wind_speed)
+        self._wind_label.set_position((wx_pos, wy_pos + (ylim[1]-ylim[0])*0.03))
 
         # Drone markers
         drone_cols = ["#FF80AB","#80D8FF","#CCFF90","#FFD180","#EA80FC"]
@@ -1222,21 +1316,24 @@ class FERDA_System:
 
         # Firelines
         candidates = self._advise_firelines()
-        for (ln, mk) in self._fl_artists:
-            try: ln.remove()
-            except Exception: pass
-            try: mk.remove()
-            except Exception: pass
+        for artist_set in self._fl_artists:
+            for artist in artist_set:
+                try: artist.remove()
+                except Exception: pass
         self._fl_artists = []
         for c in candidates:
             ax0, ti = c["anchor"], c["tip"]
             ln, = self.ax.plot([ax0[0], ti[0]], [ax0[1], ti[1]],
-                               color=c["color"], linewidth=2.8,
-                               linestyle="-", zorder=10)
+                               color=c["color"], linewidth=2.2,
+                               linestyle="-", zorder=10, alpha=0.85)
             mk, = self.ax.plot(ax0[0], ax0[1], marker="^",
-                               color=c["color"], markersize=9,
+                               color=c["color"], markersize=8,
                                zorder=11, linewidth=0)
-            self._fl_artists.append((ln, mk))
+            lbl = self.ax.text(ax0[0], ax0[1] - 14, str(c["rank"]),
+                               color=c["color"], fontsize=7,
+                               fontweight="bold", ha="center", va="top",
+                               zorder=12)
+            self._fl_artists.append((ln, mk, lbl))
 
         # Map title
         wx = getattr(self.terrain, "weather", None)
@@ -1282,13 +1379,28 @@ class FERDA_System:
             + f"Safety r {sz_rad:.0f} m  (4x flame)"
         )
 
-        # FIRELINE RECOMMENDATIONS panel
-        fl_txt = [f"Attack mode:\n  {atk_str}\n"]
+        # FIRELINE RECOMMENDATIONS panel — compact 3-line-per-candidate format
+        fl_txt = [f"Attack: {atk_str}\n"]
         for c in candidates:
+            # Wrap the reason text to the panel width (~40 chars) ourselves
+            # rather than relying on matplotlib auto-wrap, which can clip.
+            reason = c["reason"]
+            wrap_at = 40
+            words = reason.split()
+            wrapped_lines, cur = [], ""
+            for w in words:
+                if len(cur) + len(w) + 1 > wrap_at:
+                    wrapped_lines.append(cur)
+                    cur = w
+                else:
+                    cur = f"{cur} {w}".strip()
+            if cur:
+                wrapped_lines.append(cur)
+            reason_block = "\n    ".join(wrapped_lines[:2])  # cap at 2 lines
+
             fl_txt.append(
-                f"[{c['rank']}] {c['label']}\n"
-                f"    {c['reason'][:58]}\n"
-                f"    Length: {c['length']:.0f} m\n"
+                f"[{c['rank']}] {c['label']}  ({c['length']:.0f}m)\n"
+                f"    {reason_block}"
             )
         self._txt_fireln.set_text("\n".join(fl_txt))
 
@@ -1478,6 +1590,6 @@ def main():
         plt.ioff()
         plt.show()
 
+
 if __name__ == "__main__":
     main()
-    
